@@ -15,6 +15,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from google import genai
+from google.genai import types
 from telegram import Update
 from telegram.ext import (
     Application,
@@ -213,7 +214,7 @@ async def parse_receipt_photo(image_bytes: bytes) -> dict:
         model=GEMINI_MODEL_NAME,
         contents=[
             PARSE_RECEIPT_PHOTO_PROMPT,
-            {"mime_type": "image/jpeg", "data": image_bytes},
+            types.Part.from_bytes(data=image_bytes, mime_type="image/jpeg"),
         ],
     )
     lines = response.text.strip().split("\n")
