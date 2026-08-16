@@ -33,7 +33,6 @@ TELEGRAM_BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
 GEMINI_API_KEY = os.environ["GEMINI_API_KEY"]
 ADMIN_SECRET = os.environ["ADMIN_SECRET"]
 DATABASE_PATH = os.environ.get("DATABASE_PATH", "./data/beta_test.db")
-os.makedirs(os.path.dirname(os.path.abspath(DATABASE_PATH)), exist_ok=True)
 
 gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
@@ -55,18 +54,6 @@ def get_db():
     conn = sqlite3.connect(DATABASE_PATH)
     conn.row_factory = sqlite3.Row
     return conn
-
-
-def init_schema():
-    """Creates all tables if they don't exist yet — safe to run every startup,
-    since every CREATE statement in Schema.sql uses IF NOT EXISTS."""
-    schema_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "Schema.sql")
-    conn = sqlite3.connect(DATABASE_PATH)
-    with open(schema_path) as f:
-        conn.executescript(f.read())
-    conn.commit()
-    conn.close()
-    logger.info(f"Schema verified/initialized at {DATABASE_PATH}")
 
 
 def ensure_user(user_id: int, username: str):
@@ -377,7 +364,6 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # Entry point
 # ------------------------------------------------------------
 def main():
-    init_schema()
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
