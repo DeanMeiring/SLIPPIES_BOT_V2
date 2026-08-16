@@ -201,3 +201,23 @@ CREATE TABLE IF NOT EXISTS pending_imports (
     asked_at         TEXT NOT NULL DEFAULT (datetime('now')),
     fulfilled        INTEGER NOT NULL DEFAULT 0
 );
+
+-- ------------------------------------------------------------
+-- 10. INCOME
+-- Money received — salary, refunds, gifts. Separate from receipts
+-- (which tracks spend) so "how much did I get paid" and "how much
+-- did I spend" are two clean, independent questions.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS income (
+    income_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id        INTEGER NOT NULL REFERENCES profiles(profile_id),
+    source            TEXT,                  -- e.g. "CASHFOCUS SALARIS", "JM", "SARS refund"
+    amount            REAL NOT NULL,
+    received_at       TEXT NOT NULL,
+    category          TEXT DEFAULT 'other_income',  -- 'salary', 'transfer_in', 'other_income'
+    source_type       TEXT DEFAULT 'telegram_text', -- 'telegram_text' or 'bulk_import'
+    created_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_income_profile_date
+    ON income(profile_id, received_at);
