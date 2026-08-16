@@ -103,8 +103,37 @@ def create_license_code(code: str, label: str = ""):
     conn.close()
 
 
-def log_user_in(user_id: int, code: str):
+def get_or_create_profile(code: str) -> int:
+    """Each license code owns exactly one profile. Returns its profile_id,
+    creating the profile on first use of that code."""
     conn = get_db()
+    row = conn.execute(
+        "SELECT profile_id FROM profiles WHERE license_code = ?", (code,)
+    ).fetchone()
+    if row:
+        profile_id = row["profile_id"]
+    else:
+        cur = conn.execute(
+            "INSERT INTO profiles (license_code, label) VALUES (?, ?)", (code, code)
+        )
+        profile_id = cur.lastrowid
+    conn.commit()
+    conn.close()
+    return profile_id
+
+
+def log_user_in(user_id: int, code: str):
+    """Sets this Telegram user's ACTIVE profile to the one owned by `code`.
+    Also updates the users table's display fields for convenience."""
+    profile_id = get_or_create_profile(code)
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO user_active_profile (user_id, profile_id, switched_at)
+           VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET
+             profile_id = excluded.profile_id, switched_at = excluded.switched_at""",
+        (user_id, profile_id, datetime.now().isoformat()),
+    )
     conn.execute(
         """UPDATE users SET license_code = ?, logged_in_at = ?
            WHERE user_id = ?""",
@@ -112,24 +141,48 @@ def log_user_in(user_id: int, code: str):
     )
     conn.commit()
     conn.close()
+    return profile_id
 
 
 def is_logged_in(user_id: int) -> bool:
     conn = get_db()
     row = conn.execute(
-        "SELECT license_code FROM users WHERE user_id = ?", (user_id,)
+        "SELECT profile_id FROM user_active_profile WHERE user_id = ?", (user_id,)
     ).fetchone()
     conn.close()
-    return row is not None and row["license_code"] is not None
+    return row is not None
 
 
-def insert_receipt_and_item(user_id: int, merchant: str, amount: float,
+def get_active_profile(user_id: int) -> int:
+    """The profile_id for whatever this Telegram user last logged into.
+    Every data operation (log, query, import) goes through this."""
+    conn = get_db()
+    row = conn.execute(
+        "SELECT profile_id FROM user_active_profile WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return row["profile_id"] if row else None
+
+
+def get_active_profile_label(user_id: int) -> str:
+    conn = get_db()
+    row = conn.execute(
+        """SELECT p.label FROM user_active_profile uap
+           JOIN profiles p ON uap.profile_id = p.profile_id
+           WHERE uap.user_id = ?""",
+        (user_id,),
+    ).fetchone()
+    conn.close()
+    return row["label"] if row else "unknown"
+
+
+def insert_receipt_and_item(profile_id: int, merchant: str, amount: float,
                              category: str, description: str, source: str = "telegram_text"):
     conn = get_db()
     cur = conn.execute(
-        """INSERT INTO receipts (user_id, merchant, total_amount, purchased_at, source)
+        """INSERT INTO receipts (profile_id, merchant, total_amount, purchased_at, source)
            VALUES (?, ?, ?, ?, ?)""",
-        (user_id, merchant, amount, datetime.now().isoformat(), source),
+        (profile_id, merchant, amount, datetime.now().isoformat(), source),
     )
     receipt_id = cur.lastrowid
     conn.execute(
@@ -142,13 +195,13 @@ def insert_receipt_and_item(user_id: int, merchant: str, amount: float,
     return receipt_id
 
 
-def get_recent_summary(user_id: int, limit: int = 10) -> list:
+def get_recent_summary(profile_id: int, limit: int = 10) -> list:
     conn = get_db()
     rows = conn.execute(
         """SELECT merchant, total_amount, purchased_at
-           FROM receipts WHERE user_id = ?
+           FROM receipts WHERE profile_id = ?
            ORDER BY purchased_at DESC LIMIT ?""",
-        (user_id, limit),
+        (profile_id, limit),
     ).fetchall()
     conn.close()
     return [dict(r) for r in rows]
@@ -167,7 +220,7 @@ def touch_user_activity(user_id: int):
     conn.close()
 
 
-def get_category_spend(user_id: int, category: str, days: int = 30) -> dict:
+def get_category_spend(profile_id: int, category: str, days: int = 30) -> dict:
     """Sums spend for a category over the trailing N days."""
     conn = get_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
@@ -175,56 +228,56 @@ def get_category_spend(user_id: int, category: str, days: int = 30) -> dict:
         """SELECT COALESCE(SUM(ri.amount), 0) as total, COUNT(*) as cnt
            FROM receipt_items ri
            JOIN receipts r ON ri.receipt_id = r.receipt_id
-           WHERE r.user_id = ? AND ri.category = ? AND r.purchased_at >= ?""",
-        (user_id, category, cutoff),
+           WHERE r.profile_id = ? AND ri.category = ? AND r.purchased_at >= ?""",
+        (profile_id, category, cutoff),
     ).fetchone()
     conn.close()
     return {"total": row["total"], "count": row["cnt"]}
 
 
-def has_import(user_id: int) -> bool:
-    """True if this user has ever had a bulk import land (source='bulk_import')."""
+def has_import(profile_id: int) -> bool:
+    """True if this profile has ever had a bulk import land (source='bulk_import')."""
     conn = get_db()
     row = conn.execute(
-        "SELECT 1 FROM receipts WHERE user_id = ? AND source = 'bulk_import' LIMIT 1",
-        (user_id,),
+        "SELECT 1 FROM receipts WHERE profile_id = ? AND source = 'bulk_import' LIMIT 1",
+        (profile_id,),
     ).fetchone()
     conn.close()
     return row is not None
 
 
-def get_import_ask_status(user_id: int) -> dict:
+def get_import_ask_status(profile_id: int) -> dict:
     conn = get_db()
     row = conn.execute(
-        "SELECT asked_at, fulfilled FROM pending_imports WHERE user_id = ?", (user_id,)
+        "SELECT asked_at, fulfilled FROM pending_imports WHERE profile_id = ?", (profile_id,)
     ).fetchone()
     conn.close()
     return dict(row) if row else None
 
 
-def mark_import_asked(user_id: int):
+def mark_import_asked(profile_id: int):
     conn = get_db()
     conn.execute(
-        """INSERT INTO pending_imports (user_id, asked_at) VALUES (?, ?)
-           ON CONFLICT(user_id) DO UPDATE SET asked_at = excluded.asked_at""",
-        (user_id, datetime.now().isoformat()),
+        """INSERT INTO pending_imports (profile_id, asked_at) VALUES (?, ?)
+           ON CONFLICT(profile_id) DO UPDATE SET asked_at = excluded.asked_at""",
+        (profile_id, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
 
 
-def mark_import_fulfilled(user_id: int):
+def mark_import_fulfilled(profile_id: int):
     conn = get_db()
     conn.execute(
-        """INSERT INTO pending_imports (user_id, fulfilled) VALUES (?, 1)
-           ON CONFLICT(user_id) DO UPDATE SET fulfilled = 1""",
-        (user_id,),
+        """INSERT INTO pending_imports (profile_id, fulfilled) VALUES (?, 1)
+           ON CONFLICT(profile_id) DO UPDATE SET fulfilled = 1""",
+        (profile_id,),
     )
     conn.commit()
     conn.close()
 
 
-def bulk_insert_receipts(user_id: int, rows: list, batch_id: str) -> int:
+def bulk_insert_receipts(profile_id: int, rows: list, batch_id: str) -> int:
     """rows: list of dicts with merchant, amount, purchased_at, category.
     Writes both a receipts row AND a matching receipt_items row (with the
     locally-derived category) so bulk-imported spend shows up correctly
@@ -234,9 +287,9 @@ def bulk_insert_receipts(user_id: int, rows: list, batch_id: str) -> int:
     inserted = 0
     for row in rows:
         cur = conn.execute(
-            """INSERT INTO receipts (user_id, merchant, total_amount, purchased_at, source, import_batch_id)
+            """INSERT INTO receipts (profile_id, merchant, total_amount, purchased_at, source, import_batch_id)
                VALUES (?, ?, ?, ?, 'bulk_import', ?)""",
-            (user_id, row["merchant"], row["amount"], row["purchased_at"], batch_id),
+            (profile_id, row["merchant"], row["amount"], row["purchased_at"], batch_id),
         )
         receipt_id = cur.lastrowid
         conn.execute(
@@ -251,23 +304,24 @@ def bulk_insert_receipts(user_id: int, rows: list, batch_id: str) -> int:
 
 
 def get_users_due_import_reminder(days: int = 90) -> list:
-    """Users who are logged in, still have no import, and haven't been
-    asked in the last N days (default 3 months)."""
+    """Finds (user_id, profile_id) pairs where the CURRENTLY ACTIVE profile
+    for that Telegram user still has no import, hasn't been asked in 90
+    days. Delivery goes to user_id (the Telegram chat), but the check is
+    about their currently-selected profile."""
     conn = get_db()
     cutoff = (datetime.now() - timedelta(days=days)).isoformat()
     rows = conn.execute(
-        """SELECT u.user_id FROM users u
-           LEFT JOIN pending_imports pi ON u.user_id = pi.user_id
-           WHERE u.license_code IS NOT NULL
-           AND (pi.fulfilled IS NULL OR pi.fulfilled = 0)
+        """SELECT uap.user_id, uap.profile_id FROM user_active_profile uap
+           LEFT JOIN pending_imports pi ON uap.profile_id = pi.profile_id
+           WHERE (pi.fulfilled IS NULL OR pi.fulfilled = 0)
            AND (pi.asked_at IS NULL OR pi.asked_at < ?)
            AND NOT EXISTS (
-               SELECT 1 FROM receipts r WHERE r.user_id = u.user_id AND r.source = 'bulk_import'
+               SELECT 1 FROM receipts r WHERE r.profile_id = uap.profile_id AND r.source = 'bulk_import'
            )""",
         (cutoff,),
     ).fetchall()
     conn.close()
-    return [r["user_id"] for r in rows]
+    return [(r["user_id"], r["profile_id"]) for r in rows]
 
 
 def get_all_user_ids() -> list:
@@ -302,15 +356,60 @@ def mark_checkin_sent(user_id: int):
     conn.close()
 
 
-def detect_recurring_transactions(user_id: int):
+def normalize_recurring_merchant(merchant: str) -> str:
+    """Service agreement references often embed a unique code per month
+    (e.g. MATIESGYMA-CIS5-EUNS-QP-260601, changing every occurrence).
+    If a merchant name has 3+ hyphen-separated segments, treat everything
+    after the first segment as a reference code and drop it, so the same
+    underlying debit order groups together correctly month to month."""
+    parts = merchant.split("-")
+    if len(parts) >= 4:
+        return parts[0].strip()
+    return merchant
+
+
+def register_confirmed_debit_order(profile_id: int, merchant: str, amount: float, purchased_at: str):
+    """For debit orders the bank itself already labeled — register
+    immediately as recurring rather than waiting for 2+ months of
+    pattern-matching. Uses the day-of-month from this single occurrence."""
+    # Skip trivial bank-fee line items — not worth a "your payment is due" reminder
+    if amount < 20 or merchant.strip().lower() == "fee":
+        return
+
+    merchant = normalize_recurring_merchant(merchant)
+    day = datetime.fromisoformat(purchased_at).day
+    conn = get_db()
+    existing = conn.execute(
+        "SELECT recurring_id, typical_amount FROM recurring_transactions WHERE profile_id = ? AND merchant = ?",
+        (profile_id, merchant),
+    ).fetchone()
+    if existing:
+        conn.execute(
+            """UPDATE recurring_transactions
+               SET typical_amount = ?, typical_day = ?, last_seen = ?
+               WHERE recurring_id = ?""",
+            (amount, day, purchased_at, existing["recurring_id"]),
+        )
+    else:
+        conn.execute(
+            """INSERT INTO recurring_transactions
+               (profile_id, merchant, typical_amount, typical_day, last_seen)
+               VALUES (?, ?, ?, ?, ?)""",
+            (profile_id, merchant, amount, day, purchased_at),
+        )
+    conn.commit()
+    conn.close()
+
+
+def detect_recurring_transactions(profile_id: int):
     """Groups past receipts by merchant, checks for a similar amount
     landing on a similar day-of-month across 2+ separate months."""
     conn = get_db()
     rows = conn.execute(
         """SELECT merchant, total_amount, purchased_at FROM receipts
-           WHERE user_id = ? AND merchant IS NOT NULL
+           WHERE profile_id = ? AND merchant IS NOT NULL
            ORDER BY merchant, purchased_at""",
-        (user_id,),
+        (profile_id,),
     ).fetchall()
 
     by_merchant = {}
@@ -338,10 +437,9 @@ def detect_recurring_transactions(user_id: int):
         typical_day = round(sum(days) / len(days))
         last_seen = max(t["purchased_at"] for t in txns)
 
-        # Manual upsert (no UNIQUE constraint declared on user_id+merchant)
         existing = conn.execute(
-            "SELECT recurring_id FROM recurring_transactions WHERE user_id = ? AND merchant = ?",
-            (user_id, merchant),
+            "SELECT recurring_id FROM recurring_transactions WHERE profile_id = ? AND merchant = ?",
+            (profile_id, merchant),
         ).fetchone()
         if existing:
             conn.execute(
@@ -353,23 +451,26 @@ def detect_recurring_transactions(user_id: int):
         else:
             conn.execute(
                 """INSERT INTO recurring_transactions
-                   (user_id, merchant, typical_amount, typical_day, last_seen)
+                   (profile_id, merchant, typical_amount, typical_day, last_seen)
                    VALUES (?, ?, ?, ?, ?)""",
-                (user_id, merchant, avg_amount, typical_day, last_seen),
+                (profile_id, merchant, avg_amount, typical_day, last_seen),
             )
     conn.commit()
     conn.close()
 
 
 def get_due_recurring_reminders() -> list:
-    """Recurring items whose typical day is tomorrow, not yet reminded this cycle."""
+    """Recurring items whose typical day is tomorrow, not yet reminded
+    this cycle. Joins through user_active_profile to find which Telegram
+    user currently has that profile active, so the reminder reaches them."""
     conn = get_db()
     tomorrow = (datetime.now() + timedelta(days=1)).day
     today_str = datetime.now().date().isoformat()
     rows = conn.execute(
-        """SELECT * FROM recurring_transactions
-           WHERE active = 1 AND typical_day = ?
-           AND (last_reminded_at IS NULL OR last_reminded_at < ?)""",
+        """SELECT rt.*, uap.user_id FROM recurring_transactions rt
+           JOIN user_active_profile uap ON rt.profile_id = uap.profile_id
+           WHERE rt.active = 1 AND rt.typical_day = ?
+           AND (rt.last_reminded_at IS NULL OR rt.last_reminded_at < ?)""",
         (tomorrow, today_str),
     ).fetchall()
     conn.close()
@@ -474,19 +575,25 @@ def categorize_locally(description: str, type_suffix: str = "") -> str:
     """Fast keyword-based categorization for bulk imports — avoids an
     expensive per-row Gemini call across potentially hundreds of rows."""
     type_lower = type_suffix.lower()
-    # Internal account transfers aren't real spending — tag separately
-    # so they don't inflate category totals, but keep the data (in case
-    # the person wants to see it later).
     if "ib transfer" in type_lower or "transfer to" in type_lower:
         return "transfer"
     if "cash withdrawal" in type_lower:
         return "cash_withdrawal"
+    if "debit order" in type_lower or "service agreement" in type_lower:
+        return "debit_order"
 
     desc_lower = description.lower()
     for category, keywords in CATEGORY_KEYWORDS.items():
         if any(kw in desc_lower for kw in keywords):
             return category
     return "other"
+
+
+def is_bank_labeled_debit_order(type_suffix: str) -> bool:
+    """The bank itself tells us this is a recurring payment — no need
+    to wait for 2+ months of pattern-matching to figure it out."""
+    type_lower = type_suffix.lower()
+    return "debit order" in type_lower or "service agreement" in type_lower
 
 
 def clean_merchant_description(raw: str) -> str:
@@ -567,12 +674,14 @@ def parse_bulk_excel(file_bytes: bytes) -> list:
         merchant = clean_merchant_description(str(desc_val))
         type_suffix = str(desc_val).split(" - ")[-1].strip() if " - " in str(desc_val) else ""
         category = categorize_locally(merchant, type_suffix)
+        is_debit_order = is_bank_labeled_debit_order(type_suffix)
 
         results.append({
             "merchant": merchant,
             "amount": total_amount,
             "purchased_at": purchased_at,
             "category": category,
+            "is_debit_order": is_debit_order,
         })
     return results
 
@@ -641,9 +750,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username or user.first_name)
     if is_logged_in(user.id):
+        active_label = get_active_profile_label(user.id)
         await update.message.reply_text(
-            "Welcome back — SlippiesBot beta is ready. Send a receipt photo or "
-            "just tell me what you spent, e.g. \"spent R150 on lunch at Nandos\"."
+            f"Welcome back — active profile: {active_label}. Send a receipt photo or "
+            "just tell me what you spent, e.g. \"spent R150 on lunch at Nandos\". "
+            "Use /login ANOTHERCODE anytime to switch profiles."
         )
     else:
         await update.message.reply_text(
@@ -663,16 +774,16 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     code = context.args[0].upper()
     if license_code_valid(code):
-        log_user_in(user.id, code)
-        await update.message.reply_text(f"✅ Access granted — logged in with {code}.")
+        profile_id = log_user_in(user.id, code)
+        await update.message.reply_text(f"✅ Access granted — switched to profile: {code}.")
 
-        if not has_import(user.id):
-            mark_import_asked(user.id)
+        if not has_import(profile_id):
+            mark_import_asked(profile_id)
             await update.message.reply_text(
-                "📎 Got a spreadsheet of your last 3 months of spending? Upload it here "
-                "as a file and I'll import it — gives me a real baseline right away "
-                "instead of starting from zero. Totally optional, just send a receipt "
-                "or transaction whenever you're ready if you'd rather skip this."
+                "📎 Got a spreadsheet of the last 3 months of spending for THIS profile? "
+                "Upload it here as a file and I'll import it — gives me a real baseline "
+                "right away instead of starting from zero. Totally optional, just send a "
+                "receipt or transaction whenever you're ready if you'd rather skip this."
             )
     else:
         await update.message.reply_text("❌ License code not found.")
@@ -714,10 +825,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text("🔒 Locked. Please /login YOURCODE first.")
         return
 
+    profile_id = get_active_profile(user.id)
     message_text = update.message.text
 
     intent = await classify_intent(message_text)
-    logger.info(f"user={user.id} intent={intent} msg={message_text!r}")
+    logger.info(f"user={user.id} profile={profile_id} intent={intent} msg={message_text!r}")
 
     if intent == "log_transaction":
         parsed = await parse_transaction(message_text)
@@ -731,7 +843,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             return
 
         insert_receipt_and_item(
-            user_id=user.id,
+            profile_id=profile_id,
             merchant=parsed.get("merchant", "unknown"),
             amount=amount,
             category=parsed.get("category", "other"),
@@ -742,7 +854,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             f"Logged: R{amount:.2f} — {parsed.get('category', 'other')} "
             f"({parsed.get('merchant', 'unknown')})"
         )
-        detect_recurring_transactions(user.id)
+        detect_recurring_transactions(profile_id)
 
     elif intent == "category_query":
         parsed = await parse_category_query(message_text)
@@ -759,9 +871,9 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 """SELECT COALESCE(SUM(ri.amount),0) as total, COUNT(*) as cnt
                    FROM receipt_items ri
                    JOIN receipts r ON ri.receipt_id = r.receipt_id
-                   WHERE r.user_id = ? AND r.purchased_at >= ?
+                   WHERE r.profile_id = ? AND r.purchased_at >= ?
                    AND ri.category NOT IN ('transfer', 'cash_withdrawal')""",
-                (user.id, cutoff),
+                (profile_id, cutoff),
             ).fetchone()
             conn.close()
             await update.message.reply_text(
@@ -769,7 +881,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"(Internal transfers and cash withdrawals aren't counted as spend.)"
             )
         else:
-            result = get_category_spend(user.id, category, days)
+            result = get_category_spend(profile_id, category, days)
             if result["count"] == 0:
                 await update.message.reply_text(f"No {category} spending found in the last {days} days.")
             else:
@@ -779,15 +891,15 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 )
 
     elif intent == "request_file":
-        buffer = build_excel_export(user.id)
+        buffer = build_excel_export(profile_id)
         await update.message.reply_document(
             document=buffer,
-            filename=f"slippies_transactions_{user.id}.xlsx",
-            caption="📊 Here's your full transaction history."
+            filename=f"slippies_transactions_{profile_id}.xlsx",
+            caption="📊 Here's your full transaction history for this profile."
         )
 
     elif intent == "request_report":
-        rows = get_recent_summary(user.id)
+        rows = get_recent_summary(profile_id)
         if not rows:
             await update.message.reply_text("📭 Nothing logged yet — nothing to report.")
             return
@@ -812,6 +924,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 Locked. Please /login YOURCODE first.")
         return
 
+    profile_id = get_active_profile(user.id)
     doc = update.message.document
     if not (doc.file_name or "").lower().endswith((".xlsx", ".xls")):
         await update.message.reply_text("I can only import .xlsx or .xls files right now.")
@@ -830,17 +943,30 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        batch_id = f"{user.id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        inserted = bulk_insert_receipts(user.id, rows, batch_id)
-        mark_import_fulfilled(user.id)
-        detect_recurring_transactions(user.id)
+        batch_id = f"{profile_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+        inserted = bulk_insert_receipts(profile_id, rows, batch_id)
+        mark_import_fulfilled(profile_id)
+
+        # Bank already told us which of these are debit orders — register
+        # immediately instead of waiting on pattern detection
+        debit_order_count = 0
+        for row in rows:
+            if row.get("is_debit_order"):
+                register_confirmed_debit_order(
+                    profile_id, row["merchant"], row["amount"], row["purchased_at"]
+                )
+                debit_order_count += 1
+
+        detect_recurring_transactions(profile_id)
 
         await status_msg.edit_text(
-            f"✅ Imported {inserted} transactions from your file. "
-            f"I'll use this as your baseline going forward."
+            f"✅ Imported {inserted} transactions into this profile"
+            + (f", including {debit_order_count} recurring debit order(s) I'll remind you about."
+               if debit_order_count else ".")
+            + " I'll use this as the baseline going forward."
         )
     except Exception as e:
-        logger.error(f"Import failed for user={user.id}: {e}")
+        logger.error(f"Import failed for user={user.id} profile={profile_id}: {e}")
         await status_msg.edit_text(f"❌ Couldn't process that file: {e}")
 
 
@@ -853,6 +979,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("🔒 Locked. Please /login YOURCODE first.")
         return
 
+    profile_id = get_active_profile(user.id)
     status_msg = await update.message.reply_text("AI is reading your slip... 🧠")
     try:
         photo_file = await update.message.photo[-1].get_file()
@@ -862,7 +989,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         amount = float(parsed.get("amount", "0"))
 
         insert_receipt_and_item(
-            user_id=user.id,
+            profile_id=profile_id,
             merchant=parsed.get("merchant", "unknown"),
             amount=amount,
             category=parsed.get("category", "other"),
@@ -874,7 +1001,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"✅ Logged: R{amount:.2f} — {parsed.get('category', 'other')} "
             f"({parsed.get('merchant', 'unknown')})"
         )
-        detect_recurring_transactions(user.id)
+        detect_recurring_transactions(profile_id)
     except Exception as e:
         logger.error(f"Photo processing failed for user={user.id}: {e}")
         await status_msg.edit_text(f"❌ Couldn't read that slip: {e}")
@@ -913,17 +1040,18 @@ async def check_recurring_reminders(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def check_import_reminders(context: ContextTypes.DEFAULT_TYPE):
-    """Nudges users who still haven't uploaded a 3-month history file,
-    roughly every 3 months, so the offer doesn't just get asked once and dropped."""
-    for user_id in get_users_due_import_reminder(days=90):
+    """Nudges users whose currently-active profile still hasn't had a
+    3-month history file uploaded, roughly every 3 months, so the offer
+    doesn't just get asked once and dropped."""
+    for user_id, profile_id in get_users_due_import_reminder(days=90):
         try:
             await context.bot.send_message(
                 chat_id=user_id,
-                text="📎 Still happy to import a spreadsheet of your spending history "
-                     "if you've got one handy — just send it here as a file whenever suits."
+                text="📎 Still happy to import a spreadsheet of spending history for your "
+                     "current profile if you've got one handy — just send it here as a file."
             )
-            mark_import_asked(user_id)
-            logger.info(f"Sent import reminder to user={user_id}")
+            mark_import_asked(profile_id)
+            logger.info(f"Sent import reminder to user={user_id} profile={profile_id}")
         except Exception as e:
             logger.error(f"Failed to send import reminder to user={user_id}: {e}")
 
