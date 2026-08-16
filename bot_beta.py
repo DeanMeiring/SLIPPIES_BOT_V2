@@ -195,6 +195,65 @@ def insert_receipt_and_item(profile_id: int, merchant: str, amount: float,
     return receipt_id
 
 
+def insert_income(profile_id: int, source: str, amount: float, received_at: str,
+                   category: str = "other_income", source_type: str = "telegram_text"):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO income (profile_id, source, amount, received_at, category, source_type)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (profile_id, source, amount, received_at, category, source_type),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_income_total(profile_id: int, days: int = 30, category: str = None) -> dict:
+    """Sums income over the trailing N days. By default excludes
+    transfer_in (money moved between your own accounts isn't 'getting
+    paid'), same logic as the spend side excluding internal transfers."""
+    conn = get_db()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    if category:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM income
+               WHERE profile_id = ? AND received_at >= ? AND category = ?""",
+            (profile_id, cutoff, category),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT COALESCE(SUM(amount),0) as total, COUNT(*) as cnt FROM income
+               WHERE profile_id = ? AND received_at >= ? AND category != 'transfer_in'""",
+            (profile_id, cutoff),
+        ).fetchone()
+    conn.close()
+    return {"total": row["total"], "count": row["cnt"]}
+
+
+def categorize_income_locally(description: str, type_suffix: str = "") -> str:
+    type_lower = type_suffix.lower()
+    desc_lower = description.lower()
+    if "ib transfer" in type_lower:
+        return "transfer_in"
+    if "salar" in desc_lower or "credit transfer" in type_lower:
+        return "salary"
+    return "other_income"
+
+
+def bulk_insert_income(profile_id: int, rows: list, batch_id: str) -> int:
+    conn = get_db()
+    inserted = 0
+    for row in rows:
+        conn.execute(
+            """INSERT INTO income (profile_id, source, amount, received_at, category, source_type)
+               VALUES (?, ?, ?, ?, ?, 'bulk_import')""",
+            (profile_id, row["source"], row["amount"], row["received_at"], row["category"]),
+        )
+        inserted += 1
+    conn.commit()
+    conn.close()
+    return inserted
+
+
 def get_recent_summary(profile_id: int, limit: int = 10) -> list:
     conn = get_db()
     rows = conn.execute(
@@ -492,14 +551,32 @@ def mark_recurring_reminded(recurring_id: int):
 # ------------------------------------------------------------
 INTENT_PROMPT = """Classify this Telegram message into exactly one category:
 - "log_transaction": user is telling you about money they spent
+- "log_income": user is telling you about money they received/got paid
 - "category_query": user is asking how much they spent on something (e.g. "how much on groceries this month")
+- "income_query": user is asking how much they got paid or received (e.g. "how much did I get paid", "how much income this month")
 - "request_file": user wants their transaction history as a downloadable file/Excel
 - "request_report": user wants a general summary of recent spending
 - "other": anything else (greeting, question, unrelated)
 
 Message: "{message}"
 
-Reply with ONLY one word: log_transaction, category_query, request_file, request_report, or other."""
+Reply with ONLY one word: log_transaction, log_income, category_query, income_query, request_file, request_report, or other."""
+
+PARSE_INCOME_PROMPT = """Extract the income details from this message.
+Reply in EXACTLY this format, nothing else:
+source: <who paid them, or "unknown">
+amount: <numeric amount only, no currency symbol>
+category: <one of: salary, other_income>
+
+Message: "{message}"
+"""
+
+INCOME_QUERY_PROMPT = """The user is asking how much money they received/got paid.
+Reply in EXACTLY this format, nothing else:
+days: <number of days to look back — 7 for "this week", 30 for "this month", 365 for "this year", 30 if unclear>
+
+Message: "{message}"
+"""
 
 PARSE_TRANSACTION_PROMPT = """Extract the transaction details from this message.
 Reply in EXACTLY this format, nothing else:
@@ -610,17 +687,16 @@ def clean_merchant_description(raw: str) -> str:
     return name or "unknown"
 
 
-def parse_bulk_excel(file_bytes: bytes) -> list:
+def parse_bulk_excel(file_bytes: bytes) -> dict:
     """Parses a Standard Bank-style transaction export:
     columns Date | Description | In (R) | Out (R) | Bank fees (R) | Balance (R).
     Dates have no year in the row itself — the year appears as its own
     header row (e.g. a lone '2026') partway through the sheet.
-    Only outflow (Out + Bank fees) rows are imported as spend; pure
-    deposits/income rows are skipped, since this bot tracks spending."""
+    Returns {"expenses": [...], "income": [...]} — outflow rows become
+    expenses, inflow (In) rows become income, so both sides get imported."""
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.active
 
-    # Locate header row and map column names flexibly
     header_row_idx = None
     headers = []
     for row in ws.iter_rows(min_row=1, max_row=5):
@@ -631,24 +707,24 @@ def parse_bulk_excel(file_bytes: bytes) -> list:
             break
 
     if header_row_idx is None:
-        return []
+        return {"expenses": [], "income": []}
 
     date_col = next((i for i, h in enumerate(headers) if "date" in h), None)
     desc_col = next((i for i, h in enumerate(headers) if "description" in h), None)
+    in_col = next((i for i, h in enumerate(headers) if h.strip().startswith("in")), None)
     out_col = next((i for i, h in enumerate(headers) if "out" in h), None)
     fee_col = next((i for i, h in enumerate(headers) if "fee" in h), None)
 
     if date_col is None or desc_col is None:
-        return []
+        return {"expenses": [], "income": []}
 
-    results = []
+    expenses, income = [], []
     current_year = datetime.now().year  # fallback if no year row is ever found
 
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
         date_val = row[date_col] if date_col < len(row) else None
         desc_val = row[desc_col] if desc_col < len(row) else None
 
-        # A lone 4-digit year row (e.g. "2026") sets context, not a transaction
         if date_val and str(date_val).strip().isdigit() and len(str(date_val).strip()) == 4:
             current_year = int(str(date_val).strip())
             continue
@@ -656,46 +732,184 @@ def parse_bulk_excel(file_bytes: bytes) -> list:
         if not date_val or not desc_val:
             continue
 
+        in_val = row[in_col] if in_col is not None and in_col < len(row) else None
         out_val = row[out_col] if out_col is not None and out_col < len(row) else None
         fee_val = row[fee_col] if fee_col is not None and fee_col < len(row) else None
 
+        in_amount = abs(in_val) if isinstance(in_val, (int, float)) else 0
         out_amount = abs(out_val) if isinstance(out_val, (int, float)) else 0
         fee_amount = abs(fee_val) if isinstance(fee_val, (int, float)) else 0
-        total_amount = out_amount + fee_amount
-
-        if total_amount <= 0:
-            continue  # skip deposits/income rows — not spend
 
         try:
-            purchased_at = datetime.strptime(f"{str(date_val).strip()} {current_year}", "%d %b %Y").isoformat()
+            when = datetime.strptime(f"{str(date_val).strip()} {current_year}", "%d %b %Y").isoformat()
         except ValueError:
             continue  # unparseable date, skip rather than guess
 
         merchant = clean_merchant_description(str(desc_val))
         type_suffix = str(desc_val).split(" - ")[-1].strip() if " - " in str(desc_val) else ""
-        category = categorize_locally(merchant, type_suffix)
-        is_debit_order = is_bank_labeled_debit_order(type_suffix)
 
-        results.append({
-            "merchant": merchant,
-            "amount": total_amount,
-            "purchased_at": purchased_at,
-            "category": category,
-            "is_debit_order": is_debit_order,
-        })
-    return results
+        if out_amount + fee_amount > 0:
+            category = categorize_locally(merchant, type_suffix)
+            expenses.append({
+                "merchant": merchant,
+                "amount": out_amount + fee_amount,
+                "purchased_at": when,
+                "category": category,
+                "is_debit_order": is_bank_labeled_debit_order(type_suffix),
+            })
+
+        if in_amount > 0:
+            income.append({
+                "source": merchant,
+                "amount": in_amount,
+                "received_at": when,
+                "category": categorize_income_locally(merchant, type_suffix),
+            })
+
+    return {"expenses": expenses, "income": income}
 
 
-async def classify_intent(message_text: str) -> str:
+COLUMN_DETECTION_PROMPT = """This is the header row and a few sample rows from a bank
+transaction export spreadsheet. Identify which column index (0-based) holds each field.
+
+Header row: {headers}
+Sample rows:
+{samples}
+
+Reply in EXACTLY this format, nothing else, using column INDEX numbers (0-based) or "none":
+date_col: <index>
+description_col: <index>
+amount_col: <index, if there's ONE column with signed amounts (negative=spend, positive=income), else "none">
+debit_col: <index, if spend/debit is a SEPARATE column, else "none">
+credit_col: <index, if income/credit is a SEPARATE column, else "none">
+date_format: <a Python strptime format string matching the date values shown, e.g. %d/%m/%Y or %Y-%m-%d>
+"""
+
+
+async def detect_generic_bank_columns(headers: list, sample_rows: list) -> dict:
+    """Uses Gemini once to figure out an unfamiliar bank export's column
+    layout, instead of hardcoding every possible bank format."""
+    samples_text = "\n".join(str(r) for r in sample_rows[:5])
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=COLUMN_DETECTION_PROMPT.format(headers=headers, samples=samples_text),
+    )
+    lines = response.text.strip().split("\n")
+    parsed = {}
+    for line in lines:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+
+async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
+    """Fallback for bank exports that don't match the Standard Bank
+    format — asks Gemini to identify the column layout once, then
+    parses every row against that mapping."""
+    wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
+    ws = wb.active
+
+    all_rows = list(ws.iter_rows(min_row=1, max_row=10, values_only=True))
+    if not all_rows:
+        return {"expenses": [], "income": []}
+
+    # Assume row 1 is the header — reasonable default for bank exports
+    headers = [str(h).strip() if h else "" for h in all_rows[0]]
+    sample_rows = all_rows[1:6]
+
+    mapping = await detect_generic_bank_columns(headers, sample_rows)
+
+    def to_int(v):
+        try:
+            return int(v)
+        except (ValueError, TypeError):
+            return None
+
+    date_col = to_int(mapping.get("date_col"))
+    desc_col = to_int(mapping.get("description_col"))
+    amount_col = to_int(mapping.get("amount_col"))
+    debit_col = to_int(mapping.get("debit_col"))
+    credit_col = to_int(mapping.get("credit_col"))
+    date_format = mapping.get("date_format", "%Y-%m-%d").strip()
+
+    if date_col is None or desc_col is None:
+        return {"expenses": [], "income": []}  # couldn't confidently map this file
+
+    expenses, income = [], []
+    for row in ws.iter_rows(min_row=2, values_only=True):
+        if date_col >= len(row) or desc_col >= len(row):
+            continue
+        date_val, desc_val = row[date_col], row[desc_col]
+        if not date_val or not desc_val:
+            continue
+
+        try:
+            if isinstance(date_val, datetime):
+                when = date_val.isoformat()
+            else:
+                when = datetime.strptime(str(date_val).strip(), date_format).isoformat()
+        except ValueError:
+            continue
+
+        merchant = str(desc_val).strip()
+        category = categorize_locally(merchant)
+
+        if amount_col is not None and amount_col < len(row) and isinstance(row[amount_col], (int, float)):
+            amt = row[amount_col]
+            if amt < 0:
+                expenses.append({"merchant": merchant, "amount": abs(amt), "purchased_at": when,
+                                  "category": category, "is_debit_order": False})
+            elif amt > 0:
+                income.append({"source": merchant, "amount": amt, "received_at": when,
+                                "category": categorize_income_locally(merchant)})
+        else:
+            if debit_col is not None and debit_col < len(row) and isinstance(row[debit_col], (int, float)) and row[debit_col]:
+                expenses.append({"merchant": merchant, "amount": abs(row[debit_col]), "purchased_at": when,
+                                  "category": category, "is_debit_order": False})
+            if credit_col is not None and credit_col < len(row) and isinstance(row[credit_col], (int, float)) and row[credit_col]:
+                income.append({"source": merchant, "amount": abs(row[credit_col]), "received_at": when,
+                                "category": categorize_income_locally(merchant)})
+
+    return {"expenses": expenses, "income": income}
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL_NAME,
         contents=INTENT_PROMPT.format(message=message_text),
     )
     intent = response.text.strip().lower()
-    valid = ("log_transaction", "category_query", "request_file", "request_report", "other")
+    valid = ("log_transaction", "log_income", "category_query", "income_query",
+              "request_file", "request_report", "other")
     if intent not in valid:
         return "other"
     return intent
+
+
+async def parse_income_entry(message_text: str) -> dict:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=PARSE_INCOME_PROMPT.format(message=message_text),
+    )
+    lines = response.text.strip().split("\n")
+    parsed = {}
+    for line in lines:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            parsed[key.strip()] = value.strip()
+    return parsed
+
+
+async def parse_income_query(message_text: str) -> dict:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=INCOME_QUERY_PROMPT.format(message=message_text),
+    )
+    lines = response.text.strip().split("\n")
+    parsed = {}
+    for line in lines:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            parsed[key.strip()] = value.strip()
+    return parsed
 
 
 async def parse_category_query(message_text: str) -> dict:
@@ -856,6 +1070,46 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         )
         detect_recurring_transactions(profile_id)
 
+    elif intent == "log_income":
+        parsed = await parse_income_entry(message_text)
+        try:
+            amount = float(parsed.get("amount", "0"))
+        except ValueError:
+            await update.message.reply_text(
+                "Couldn't quite catch the amount there — try again with a number, "
+                "e.g. \"got paid 5000 salary\"."
+            )
+            return
+
+        insert_income(
+            profile_id=profile_id,
+            source=parsed.get("source", "unknown"),
+            amount=amount,
+            received_at=datetime.now().isoformat(),
+            category=parsed.get("category", "other_income"),
+            source_type="telegram_text",
+        )
+        await update.message.reply_text(
+            f"💰 Logged income: R{amount:.2f} — {parsed.get('category', 'other_income')} "
+            f"({parsed.get('source', 'unknown')})"
+        )
+
+    elif intent == "income_query":
+        parsed = await parse_income_query(message_text)
+        try:
+            days = int(parsed.get("days", "30"))
+        except ValueError:
+            days = 30
+        result = get_income_total(profile_id, days)
+        if result["count"] == 0:
+            await update.message.reply_text(f"No income logged in the last {days} days.")
+        else:
+            await update.message.reply_text(
+                f"💰 You've received R{result['total']:.2f} in the last {days} days "
+                f"({result['count']} item{'s' if result['count'] != 1 else ''}). "
+                f"(Internal transfers between your own accounts aren't counted.)"
+            )
+
     elif intent == "category_query":
         parsed = await parse_category_query(message_text)
         category = parsed.get("category", "all")
@@ -909,7 +1163,7 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
 
     else:
         await update.message.reply_text(
-            "I mostly understand spending updates right now — try something like "
+            "I mostly understand spending and income updates right now — try something like "
             "\"spent R80 on groceries\", \"how much did I spend on transport this month\", "
             "or send a receipt photo."
         )
@@ -935,22 +1189,35 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await doc.get_file()
         file_bytes = bytes(await file.download_as_bytearray())
 
-        rows = parse_bulk_excel(file_bytes)
-        if not rows:
+        parsed = parse_bulk_excel(file_bytes)
+        expense_rows = parsed["expenses"]
+        income_rows = parsed["income"]
+
+        used_generic = False
+        if not expense_rows and not income_rows:
+            # Doesn't match Standard Bank's format — try the generic
+            # Gemini-assisted column-detection path instead
+            parsed = await parse_bulk_excel_generic(file_bytes)
+            expense_rows = parsed["expenses"]
+            income_rows = parsed["income"]
+            used_generic = True
+
+        if not expense_rows and not income_rows:
             await status_msg.edit_text(
-                "❌ Couldn't find recognizable date/amount columns in that file. "
-                "Make sure it has headers like 'Date' and 'Amount' somewhere in the first few rows."
+                "❌ Couldn't figure out this file's format. Make sure it's a transaction "
+                "export with clear date, description, and amount columns."
             )
             return
 
         batch_id = f"{profile_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        inserted = bulk_insert_receipts(profile_id, rows, batch_id)
+        expenses_inserted = bulk_insert_receipts(profile_id, expense_rows, batch_id)
+        income_inserted = bulk_insert_income(profile_id, income_rows, batch_id)
         mark_import_fulfilled(profile_id)
 
         # Bank already told us which of these are debit orders — register
         # immediately instead of waiting on pattern detection
         debit_order_count = 0
-        for row in rows:
+        for row in expense_rows:
             if row.get("is_debit_order"):
                 register_confirmed_debit_order(
                     profile_id, row["merchant"], row["amount"], row["purchased_at"]
@@ -960,10 +1227,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         detect_recurring_transactions(profile_id)
 
         await status_msg.edit_text(
-            f"✅ Imported {inserted} transactions into this profile"
+            f"✅ Imported {expenses_inserted} expenses and {income_inserted} income entries "
+            f"into this profile"
             + (f", including {debit_order_count} recurring debit order(s) I'll remind you about."
                if debit_order_count else ".")
             + " I'll use this as the baseline going forward."
+            + (" (Used general format detection for this file — categorization may be rougher "
+               "than usual, corrections help it improve.)" if used_generic else "")
         )
     except Exception as e:
         logger.error(f"Import failed for user={user.id} profile={profile_id}: {e}")
