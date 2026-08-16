@@ -142,3 +142,33 @@ CREATE TABLE IF NOT EXISTS user_activity (
     last_message_at   TEXT NOT NULL DEFAULT (datetime('now')),
     last_checkin_sent TEXT
 );
+
+-- ------------------------------------------------------------
+-- 8. RECURRING_TRANSACTIONS
+-- Detected debit-order-like patterns (same merchant, similar
+-- amount, similar day-of-month, 2+ consecutive months).
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS recurring_transactions (
+    recurring_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id          INTEGER NOT NULL REFERENCES users(user_id),
+    merchant         TEXT NOT NULL,
+    typical_amount   REAL NOT NULL,
+    typical_day      INTEGER,        -- day of month it usually hits
+    last_seen        TEXT,
+    last_reminded_at TEXT,           -- prevents duplicate day-before reminders
+    active           INTEGER NOT NULL DEFAULT 1
+);
+
+CREATE INDEX IF NOT EXISTS idx_recurring_user
+    ON recurring_transactions(user_id);
+
+-- ------------------------------------------------------------
+-- 9. PENDING_IMPORTS
+-- Tracks that a newly-logged-in user has been asked for their
+-- 3-month history upload, so we only ask once.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS pending_imports (
+    user_id          INTEGER PRIMARY KEY REFERENCES users(user_id),
+    asked_at         TEXT NOT NULL DEFAULT (datetime('now')),
+    fulfilled        INTEGER NOT NULL DEFAULT 0
+);
