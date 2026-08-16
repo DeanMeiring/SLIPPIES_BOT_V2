@@ -182,21 +182,32 @@ def get_category_spend(user_id: int, category: str, days: int = 30) -> dict:
     return {"total": row["total"], "count": row["cnt"]}
 
 
-def has_pending_import_ask(user_id: int) -> bool:
+def has_import(user_id: int) -> bool:
+    """True if this user has ever had a bulk import land (source='bulk_import')."""
     conn = get_db()
     row = conn.execute(
-        "SELECT fulfilled FROM pending_imports WHERE user_id = ?", (user_id,)
+        "SELECT 1 FROM receipts WHERE user_id = ? AND source = 'bulk_import' LIMIT 1",
+        (user_id,),
     ).fetchone()
     conn.close()
-    return row is None  # True if we've never asked yet
+    return row is not None
+
+
+def get_import_ask_status(user_id: int) -> dict:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT asked_at, fulfilled FROM pending_imports WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return dict(row) if row else None
 
 
 def mark_import_asked(user_id: int):
     conn = get_db()
     conn.execute(
-        """INSERT INTO pending_imports (user_id) VALUES (?)
-           ON CONFLICT(user_id) DO NOTHING""",
-        (user_id,),
+        """INSERT INTO pending_imports (user_id, asked_at) VALUES (?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET asked_at = excluded.asked_at""",
+        (user_id, datetime.now().isoformat()),
     )
     conn.commit()
     conn.close()
@@ -228,6 +239,26 @@ def bulk_insert_receipts(user_id: int, rows: list, batch_id: str) -> int:
     conn.commit()
     conn.close()
     return inserted
+
+
+def get_users_due_import_reminder(days: int = 90) -> list:
+    """Users who are logged in, still have no import, and haven't been
+    asked in the last N days (default 3 months)."""
+    conn = get_db()
+    cutoff = (datetime.now() - timedelta(days=days)).isoformat()
+    rows = conn.execute(
+        """SELECT u.user_id FROM users u
+           LEFT JOIN pending_imports pi ON u.user_id = pi.user_id
+           WHERE u.license_code IS NOT NULL
+           AND (pi.fulfilled IS NULL OR pi.fulfilled = 0)
+           AND (pi.asked_at IS NULL OR pi.asked_at < ?)
+           AND NOT EXISTS (
+               SELECT 1 FROM receipts r WHERE r.user_id = u.user_id AND r.source = 'bulk_import'
+           )""",
+        (cutoff,),
+    ).fetchall()
+    conn.close()
+    return [r["user_id"] for r in rows]
 
 
 def get_all_user_ids() -> list:
@@ -549,7 +580,7 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         log_user_in(user.id, code)
         await update.message.reply_text(f"✅ Access granted — logged in with {code}.")
 
-        if has_pending_import_ask(user.id):
+        if not has_import(user.id):
             mark_import_asked(user.id)
             await update.message.reply_text(
                 "📎 Got a spreadsheet of your last 3 months of spending? Upload it here "
@@ -790,6 +821,22 @@ async def check_recurring_reminders(context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send recurring reminder: {e}")
 
 
+async def check_import_reminders(context: ContextTypes.DEFAULT_TYPE):
+    """Nudges users who still haven't uploaded a 3-month history file,
+    roughly every 3 months, so the offer doesn't just get asked once and dropped."""
+    for user_id in get_users_due_import_reminder(days=90):
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="📎 Still happy to import a spreadsheet of your spending history "
+                     "if you've got one handy — just send it here as a file whenever suits."
+            )
+            mark_import_asked(user_id)
+            logger.info(f"Sent import reminder to user={user_id}")
+        except Exception as e:
+            logger.error(f"Failed to send import reminder to user={user_id}: {e}")
+
+
 # ------------------------------------------------------------
 # Entry point
 # ------------------------------------------------------------
@@ -807,6 +854,7 @@ def main():
     # Daily checks — run once every 24h, starting shortly after boot
     app.job_queue.run_repeating(check_inactive_users, interval=timedelta(hours=24), first=60)
     app.job_queue.run_repeating(check_recurring_reminders, interval=timedelta(hours=24), first=90)
+    app.job_queue.run_repeating(check_import_reminders, interval=timedelta(hours=24), first=120)
 
     logger.info("SlippiesBot beta starting...")
     app.run_polling()
