@@ -1,9 +1,0 @@
-[33mcommit 9a73fdf0baf47bbd348c6ceadbc95ba47026127f[m[33m ([m[1;36mHEAD[m[33m -> [m[1;32mmain[m[33m, [m[1;31morigin/main[m[33m, [m[1;31morigin/HEAD[m[33m)[m
-Author: Dean <102220102+DeanMeiring@users.noreply.github.com>
-Date:   Sun Aug 16 15:35:00 2026 +0000
-
-    Fix file structure: bot_beta.py at root, remove stray files
-
- Build/Bot beta.py => bot_beta.py |   0
- slippiesbot.py                   | 380 [31m-----------------------------------------------------------[m
- 2 files changed, 380 deletions(-)
