@@ -872,6 +872,7 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
                                 "category": categorize_income_locally(merchant)})
 
     return {"expenses": expenses, "income": income}
+async def classify_intent(message_text: str) -> str:
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL_NAME,
         contents=INTENT_PROMPT.format(message=message_text),
