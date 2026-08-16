@@ -6,6 +6,19 @@
 -- ============================================================
 
 -- ------------------------------------------------------------
+-- 0. LICENSE_CODES
+-- Access gate, carried over from V1's login system. Unlike V1
+-- (which tracked logins in an in-memory dict that reset on every
+-- redeploy), here the login is persisted on the user row itself.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS license_codes (
+    code            TEXT PRIMARY KEY,
+    label           TEXT,                   -- optional friendly name
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    active          INTEGER NOT NULL DEFAULT 1
+);
+
+-- ------------------------------------------------------------
 -- 1. USERS
 -- One row per Telegram user. Mirrors SlippiesBot's licensing table.
 -- ------------------------------------------------------------
@@ -15,7 +28,9 @@ CREATE TABLE IF NOT EXISTS users (
     created_at      TEXT NOT NULL DEFAULT (datetime('now')),
     timezone        TEXT DEFAULT 'Africa/Johannesburg',
     nudge_opt_in    INTEGER NOT NULL DEFAULT 1,   -- 1 = wants proactive messages, 0 = off
-    last_nudge_at   TEXT                    -- prevents spamming; set after every push
+    last_nudge_at   TEXT,                   -- prevents spamming; set after every push
+    license_code    TEXT REFERENCES license_codes(code),  -- NULL until /login succeeds
+    logged_in_at    TEXT
 );
 
 -- ------------------------------------------------------------
@@ -116,3 +131,14 @@ CREATE TABLE IF NOT EXISTS nudges_sent (
 
 CREATE INDEX IF NOT EXISTS idx_nudges_user
     ON nudges_sent(user_id, sent_at);
+
+-- ------------------------------------------------------------
+-- 7. USER_ACTIVITY
+-- Tracks last interaction per user, drives the "haven't logged
+-- anything today" proactive check-in nudge.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS user_activity (
+    user_id           INTEGER PRIMARY KEY REFERENCES users(user_id),
+    last_message_at   TEXT NOT NULL DEFAULT (datetime('now')),
+    last_checkin_sent TEXT
+);
