@@ -606,22 +606,33 @@ Message: "{message}"
 """
 
 
-def build_excel_export(user_id: int) -> io.BytesIO:
-    """Builds an in-memory .xlsx of a user's full transaction history."""
+def build_excel_export(profile_id: int) -> io.BytesIO:
+    """Builds an in-memory .xlsx of a profile's full transaction history,
+    including both expenses and income."""
     conn = get_db()
-    rows = conn.execute(
+    expense_rows = conn.execute(
         """SELECT purchased_at, merchant, total_amount, source
-           FROM receipts WHERE user_id = ? ORDER BY purchased_at DESC""",
-        (user_id,),
+           FROM receipts WHERE profile_id = ? ORDER BY purchased_at DESC""",
+        (profile_id,),
+    ).fetchall()
+    income_rows = conn.execute(
+        """SELECT received_at, source, amount, category
+           FROM income WHERE profile_id = ? ORDER BY received_at DESC""",
+        (profile_id,),
     ).fetchall()
     conn.close()
 
     wb = openpyxl.Workbook()
     ws = wb.active
-    ws.title = "Transactions"
+    ws.title = "Expenses"
     ws.append(["Date", "Merchant", "Amount (ZAR)", "Source"])
-    for r in rows:
+    for r in expense_rows:
         ws.append([r["purchased_at"][:10], r["merchant"], r["total_amount"], r["source"]])
+
+    ws2 = wb.create_sheet("Income")
+    ws2.append(["Date", "Source", "Amount (ZAR)", "Category"])
+    for r in income_rows:
+        ws2.append([r["received_at"][:10], r["source"], r["amount"], r["category"]])
 
     buffer = io.BytesIO()
     wb.save(buffer)
