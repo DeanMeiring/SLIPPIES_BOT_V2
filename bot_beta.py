@@ -225,15 +225,24 @@ def mark_import_fulfilled(user_id: int):
 
 
 def bulk_insert_receipts(user_id: int, rows: list, batch_id: str) -> int:
-    """rows: list of dicts with merchant, amount, purchased_at. No line
-    items, since bank/budget exports typically lack itemized detail."""
+    """rows: list of dicts with merchant, amount, purchased_at, category.
+    Writes both a receipts row AND a matching receipt_items row (with the
+    locally-derived category) so bulk-imported spend shows up correctly
+    in category queries — bank exports don't have line-item detail, but
+    they should still count toward category totals."""
     conn = get_db()
     inserted = 0
     for row in rows:
-        conn.execute(
+        cur = conn.execute(
             """INSERT INTO receipts (user_id, merchant, total_amount, purchased_at, source, import_batch_id)
                VALUES (?, ?, ?, ?, 'bulk_import', ?)""",
             (user_id, row["merchant"], row["amount"], row["purchased_at"], batch_id),
+        )
+        receipt_id = cur.lastrowid
+        conn.execute(
+            """INSERT INTO receipt_items (receipt_id, description, category, amount, category_source)
+               VALUES (?, ?, ?, ?, 'model')""",
+            (receipt_id, row["merchant"], row.get("category", "other"), row["amount"]),
         )
         inserted += 1
     conn.commit()
@@ -442,52 +451,129 @@ def build_excel_export(user_id: int) -> io.BytesIO:
     return buffer
 
 
+import re
+
+CATEGORY_KEYWORDS = {
+    "groceries": ["spar", "pnp", "pick n pay", "checkers", "woolworths", "kwikspar",
+                  "food lover", "boxer", "fruit", "dischem", "clicks"],
+    "eating_out": ["kfc", "steers", "nandos", "mcd", "debonairs", "wimpy", "vida",
+                   "mugg", "milky lane", "poke", "yoco", "cafe", "coffee", "restaur",
+                   "pizza", "uber eats", "mr d", "taste", "ginos", "simplygreek",
+                   "motherdough", "bootleggers", "fat cactus"],
+    "transport": ["shell", "engen", "bp ", "sasol", "total", "fuel", "petrol",
+                  "uber", "bolt", "railway", "gautrain", "toll"],
+    "health": ["dischem", "clicks", "pharmacy", "dr ", "doctor", "medical", "dentist"],
+    "entertainment": ["sterkinekor", "ster kinekor", "steamgames", "playtomic",
+                       "matiesgym", "gym", "movie", "netflix", "showmax", "spotify"],
+    "household": ["takealot", "gadget", "gadgettime", "evetech", "microsoft",
+                   "vodacom", "mtn", "cell c", "prepaid mobile", "vodashop"],
+}
+
+
+def categorize_locally(description: str, type_suffix: str = "") -> str:
+    """Fast keyword-based categorization for bulk imports — avoids an
+    expensive per-row Gemini call across potentially hundreds of rows."""
+    type_lower = type_suffix.lower()
+    # Internal account transfers aren't real spending — tag separately
+    # so they don't inflate category totals, but keep the data (in case
+    # the person wants to see it later).
+    if "ib transfer" in type_lower or "transfer to" in type_lower:
+        return "transfer"
+    if "cash withdrawal" in type_lower:
+        return "cash_withdrawal"
+
+    desc_lower = description.lower()
+    for category, keywords in CATEGORY_KEYWORDS.items():
+        if any(kw in desc_lower for kw in keywords):
+            return category
+    return "other"
+
+
+def clean_merchant_description(raw: str) -> str:
+    """Strips the trailing ' - debit card purchase' style suffix and
+    card/date noise like '5196*5223 18 MAY' from a raw bank description."""
+    if not raw:
+        return "unknown"
+    # Drop the ' - <transaction type>' suffix
+    name = raw.split(" - ")[0].strip()
+    # Drop trailing masked-card + date pattern, e.g. "5196*5223 18 MAY"
+    name = re.sub(r"\s+\d{4}\*\d{4}(\s+\d{1,2}\s+[A-Za-z]{3})?\s*$", "", name)
+    # Collapse repeated whitespace
+    name = re.sub(r"\s+", " ", name).strip()
+    return name or "unknown"
+
+
 def parse_bulk_excel(file_bytes: bytes) -> list:
-    """Flexibly reads an uploaded Excel/bank-export file. Looks for
-    columns matching common date/merchant/amount header names,
-    case-insensitive, in any order."""
+    """Parses a Standard Bank-style transaction export:
+    columns Date | Description | In (R) | Out (R) | Bank fees (R) | Balance (R).
+    Dates have no year in the row itself — the year appears as its own
+    header row (e.g. a lone '2026') partway through the sheet.
+    Only outflow (Out + Bank fees) rows are imported as spend; pure
+    deposits/income rows are skipped, since this bot tracks spending."""
     wb = openpyxl.load_workbook(io.BytesIO(file_bytes), data_only=True)
     ws = wb.active
 
-    header_row = None
+    # Locate header row and map column names flexibly
+    header_row_idx = None
+    headers = []
     for row in ws.iter_rows(min_row=1, max_row=5):
         values = [str(c.value).strip().lower() if c.value else "" for c in row]
-        if any(h in values for h in ("date", "amount", "total")):
-            header_row = row[0].row
+        if any("date" in v for v in values):
+            header_row_idx = row[0].row
             headers = values
             break
 
-    if header_row is None:
+    if header_row_idx is None:
         return []
 
     date_col = next((i for i, h in enumerate(headers) if "date" in h), None)
-    merchant_col = next((i for i, h in enumerate(headers)
-                          if any(k in h for k in ("merchant", "vendor", "description", "payee"))), None)
-    amount_col = next((i for i, h in enumerate(headers)
-                        if any(k in h for k in ("amount", "total", "value"))), None)
+    desc_col = next((i for i, h in enumerate(headers) if "description" in h), None)
+    out_col = next((i for i, h in enumerate(headers) if "out" in h), None)
+    fee_col = next((i for i, h in enumerate(headers) if "fee" in h), None)
 
-    if date_col is None or amount_col is None:
+    if date_col is None or desc_col is None:
         return []
 
     results = []
-    for row in ws.iter_rows(min_row=header_row + 1, values_only=True):
-        try:
-            raw_date = row[date_col]
-            amount = row[amount_col]
-            if raw_date is None or amount is None:
-                continue
-            if isinstance(raw_date, datetime):
-                purchased_at = raw_date.isoformat()
-            else:
-                purchased_at = str(raw_date)
-            merchant = str(row[merchant_col]) if merchant_col is not None and row[merchant_col] else "unknown"
-            results.append({
-                "merchant": merchant,
-                "amount": float(amount),
-                "purchased_at": purchased_at,
-            })
-        except (ValueError, TypeError, IndexError):
+    current_year = datetime.now().year  # fallback if no year row is ever found
+
+    for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
+        date_val = row[date_col] if date_col < len(row) else None
+        desc_val = row[desc_col] if desc_col < len(row) else None
+
+        # A lone 4-digit year row (e.g. "2026") sets context, not a transaction
+        if date_val and str(date_val).strip().isdigit() and len(str(date_val).strip()) == 4:
+            current_year = int(str(date_val).strip())
             continue
+
+        if not date_val or not desc_val:
+            continue
+
+        out_val = row[out_col] if out_col is not None and out_col < len(row) else None
+        fee_val = row[fee_col] if fee_col is not None and fee_col < len(row) else None
+
+        out_amount = abs(out_val) if isinstance(out_val, (int, float)) else 0
+        fee_amount = abs(fee_val) if isinstance(fee_val, (int, float)) else 0
+        total_amount = out_amount + fee_amount
+
+        if total_amount <= 0:
+            continue  # skip deposits/income rows — not spend
+
+        try:
+            purchased_at = datetime.strptime(f"{str(date_val).strip()} {current_year}", "%d %b %Y").isoformat()
+        except ValueError:
+            continue  # unparseable date, skip rather than guess
+
+        merchant = clean_merchant_description(str(desc_val))
+        type_suffix = str(desc_val).split(" - ")[-1].strip() if " - " in str(desc_val) else ""
+        category = categorize_locally(merchant, type_suffix)
+
+        results.append({
+            "merchant": merchant,
+            "amount": total_amount,
+            "purchased_at": purchased_at,
+            "category": category,
+        })
     return results
 
 
@@ -670,12 +756,17 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             conn = get_db()
             cutoff = (datetime.now() - timedelta(days=days)).isoformat()
             row = conn.execute(
-                "SELECT COALESCE(SUM(total_amount),0) as total, COUNT(*) as cnt FROM receipts WHERE user_id = ? AND purchased_at >= ?",
+                """SELECT COALESCE(SUM(ri.amount),0) as total, COUNT(*) as cnt
+                   FROM receipt_items ri
+                   JOIN receipts r ON ri.receipt_id = r.receipt_id
+                   WHERE r.user_id = ? AND r.purchased_at >= ?
+                   AND ri.category NOT IN ('transfer', 'cash_withdrawal')""",
                 (user.id, cutoff),
             ).fetchone()
             conn.close()
             await update.message.reply_text(
-                f"You've spent R{row['total']:.2f} in total over the last {days} days, across {row['cnt']} transactions."
+                f"You've spent R{row['total']:.2f} in total over the last {days} days, across {row['cnt']} transactions. "
+                f"(Internal transfers and cash withdrawals aren't counted as spend.)"
             )
         else:
             result = get_category_spend(user.id, category, days)
