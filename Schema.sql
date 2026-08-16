@@ -19,6 +19,34 @@ CREATE TABLE IF NOT EXISTS license_codes (
 );
 
 -- ------------------------------------------------------------
+-- 0b. PROFILES
+-- Each license code now owns its OWN separate data profile — this is
+-- what lets one Telegram account hold multiple distinct profiles
+-- (e.g. personal vs business, or managing a family member's finances).
+-- All spend data below is keyed to profile_id, not directly to the
+-- Telegram user, so switching codes switches the entire data view.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS profiles (
+    profile_id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    license_code    TEXT UNIQUE NOT NULL REFERENCES license_codes(code),
+    label           TEXT,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ------------------------------------------------------------
+-- 0c. USER_ACTIVE_PROFILE
+-- Which profile is "currently selected" for a given Telegram user.
+-- Switches every time they /login with a different code. A single
+-- Telegram user can have logged into several profiles over time, but
+-- only one is active at once — same phone, different "hats".
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS user_active_profile (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(user_id),
+    profile_id      INTEGER NOT NULL REFERENCES profiles(profile_id),
+    switched_at     TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- ------------------------------------------------------------
 -- 1. USERS
 -- One row per Telegram user. Mirrors SlippiesBot's licensing table.
 -- ------------------------------------------------------------
@@ -40,7 +68,7 @@ CREATE TABLE IF NOT EXISTS users (
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS receipts (
     receipt_id      INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         INTEGER NOT NULL REFERENCES users(user_id),
+    profile_id      INTEGER NOT NULL REFERENCES profiles(profile_id),
     merchant        TEXT,
     total_amount    REAL NOT NULL,
     currency        TEXT NOT NULL DEFAULT 'ZAR',
@@ -51,8 +79,8 @@ CREATE TABLE IF NOT EXISTS receipts (
     import_batch_id TEXT                    -- groups rows from the same uploaded file, NULL for live receipts
 );
 
-CREATE INDEX IF NOT EXISTS idx_receipts_user_date
-    ON receipts(user_id, purchased_at);
+CREATE INDEX IF NOT EXISTS idx_receipts_profile_date
+    ON receipts(profile_id, purchased_at);
 
 -- ------------------------------------------------------------
 -- 3. RECEIPT_ITEMS
@@ -99,18 +127,18 @@ CREATE TABLE IF NOT EXISTS category_corrections (
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS spend_aggregates (
     agg_id          INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         INTEGER NOT NULL REFERENCES users(user_id),
+    profile_id      INTEGER NOT NULL REFERENCES profiles(profile_id),
     category        TEXT NOT NULL,
     period_start    TEXT NOT NULL,          -- ISO date, Monday of that week
     period_type     TEXT NOT NULL DEFAULT 'week',  -- 'week' or 'month'
     total_spent     REAL NOT NULL,
     receipt_count   INTEGER NOT NULL DEFAULT 0,
     computed_at     TEXT NOT NULL DEFAULT (datetime('now')),
-    UNIQUE(user_id, category, period_start, period_type)
+    UNIQUE(profile_id, category, period_start, period_type)
 );
 
-CREATE INDEX IF NOT EXISTS idx_agg_user_period
-    ON spend_aggregates(user_id, period_start);
+CREATE INDEX IF NOT EXISTS idx_agg_profile_period
+    ON spend_aggregates(profile_id, period_start);
 
 -- ------------------------------------------------------------
 -- 6. NUDGES_SENT
@@ -120,7 +148,8 @@ CREATE INDEX IF NOT EXISTS idx_agg_user_period
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS nudges_sent (
     nudge_id        INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id         INTEGER NOT NULL REFERENCES users(user_id),
+    user_id         INTEGER NOT NULL REFERENCES users(user_id),  -- Telegram delivery target
+    profile_id      INTEGER REFERENCES profiles(profile_id),      -- which profile this nudge is about
     category        TEXT,                   -- NULL if it's an overall-spend nudge
     nudge_type      TEXT NOT NULL,          -- 'under_trend', 'over_trend', 'milestone'
     predicted_value REAL,                   -- what the model expected
@@ -150,7 +179,7 @@ CREATE TABLE IF NOT EXISTS user_activity (
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS recurring_transactions (
     recurring_id     INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id          INTEGER NOT NULL REFERENCES users(user_id),
+    profile_id       INTEGER NOT NULL REFERENCES profiles(profile_id),
     merchant         TEXT NOT NULL,
     typical_amount   REAL NOT NULL,
     typical_day      INTEGER,        -- day of month it usually hits
@@ -159,8 +188,8 @@ CREATE TABLE IF NOT EXISTS recurring_transactions (
     active           INTEGER NOT NULL DEFAULT 1
 );
 
-CREATE INDEX IF NOT EXISTS idx_recurring_user
-    ON recurring_transactions(user_id);
+CREATE INDEX IF NOT EXISTS idx_recurring_profile
+    ON recurring_transactions(profile_id);
 
 -- ------------------------------------------------------------
 -- 9. PENDING_IMPORTS
@@ -168,7 +197,7 @@ CREATE INDEX IF NOT EXISTS idx_recurring_user
 -- 3-month history upload, so we only ask once.
 -- ------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS pending_imports (
-    user_id          INTEGER PRIMARY KEY REFERENCES users(user_id),
+    profile_id       INTEGER PRIMARY KEY REFERENCES profiles(profile_id),
     asked_at         TEXT NOT NULL DEFAULT (datetime('now')),
     fulfilled        INTEGER NOT NULL DEFAULT 0
 );
