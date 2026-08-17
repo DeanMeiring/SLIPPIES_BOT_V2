@@ -69,7 +69,35 @@ def init_schema():
         conn.executescript(f.read())
     conn.commit()
     conn.close()
+    run_column_migrations()
     logger.info(f"Schema verified/initialized at {DATABASE_PATH}")
+
+
+# ------------------------------------------------------------
+# Column migrations — CREATE TABLE IF NOT EXISTS only helps for
+# brand-new tables. When a table already exists on an older volume
+# and we add a column to it in Schema.sql, that column silently
+# never gets created. This list closes that gap: every column added
+# after the very first schema version goes here once, and every
+# boot checks + adds anything missing, so a volume never needs to
+# be manually wiped again just because the schema grew.
+# ------------------------------------------------------------
+COLUMN_MIGRATIONS = [
+    # (table, column, full ADD COLUMN definition)
+    ("users", "has_seen_intro", "INTEGER NOT NULL DEFAULT 0"),
+    ("receipts", "telegram_file_id", "TEXT"),
+]
+
+
+def run_column_migrations():
+    conn = sqlite3.connect(DATABASE_PATH)
+    for table, column, definition in COLUMN_MIGRATIONS:
+        existing_cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+        if column not in existing_cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+            logger.info(f"Migration: added {table}.{column}")
+    conn.commit()
+    conn.close()
 
 
 def ensure_user(user_id: int, username: str):
@@ -1142,8 +1170,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             amount = float(parsed.get("amount", "0"))
         except ValueError:
+            amount = 0
+
+        if amount <= 0:
             await update.message.reply_text(
-                "Couldn't quite catch the amount there — try again with a number, "
+                "Couldn't catch an amount there — try again with a number, "
                 "e.g. \"spent 150 on lunch\"."
             )
             return
@@ -1167,8 +1198,11 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         try:
             amount = float(parsed.get("amount", "0"))
         except ValueError:
+            amount = 0
+
+        if amount <= 0:
             await update.message.reply_text(
-                "Couldn't quite catch the amount there — try again with a number, "
+                "Couldn't catch an amount there — try again with a number, "
                 "e.g. \"got paid 5000 salary\"."
             )
             return
