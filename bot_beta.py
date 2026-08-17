@@ -176,13 +176,55 @@ def get_active_profile_label(user_id: int) -> str:
     return row["label"] if row else "unknown"
 
 
+def has_seen_intro(user_id: int) -> bool:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT has_seen_intro FROM users WHERE user_id = ?", (user_id,)
+    ).fetchone()
+    conn.close()
+    return bool(row and row["has_seen_intro"])
+
+
+def mark_intro_seen(user_id: int):
+    conn = get_db()
+    conn.execute("UPDATE users SET has_seen_intro = 1 WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+FIRST_TIME_INTRO = (
+    "👋 Hi, I'm SlippiesBot — your personal budgeting assistant, right here in chat.\n\n"
+    "Here's the quick version:\n"
+    "• Send a photo of any receipt — I'll read it automatically AND keep it safely "
+    "stored, so you've always got the original slip if you need it later. Photos give "
+    "me the most context, so they're the best way to log something.\n"
+    "• In a rush? Just tell me instead — \"spent 150 on lunch at Nandos\"\n"
+    "• Ask me things — \"how much did I spend on groceries this month?\"\n\n"
+    "Type /help anytime for the full rundown."
+)
+
+
+def build_welcome_back_text(user_id: int) -> str:
+    label = get_active_profile_label(user_id)
+    return (
+        f"👋 Welcome back — active profile: {label}\n\n"
+        "Quick reminders:\n"
+        "• /login CODE — switch profiles (personal, business, etc.)\n"
+        "• /help — full list of everything I can do\n"
+        "• Send a receipt photo or just tell me what you spent\n"
+        "• \"how much did I spend on X\" or \"how much did I get paid\" works anytime\n\n"
+        "What's up?"
+    )
+
+
 def insert_receipt_and_item(profile_id: int, merchant: str, amount: float,
-                             category: str, description: str, source: str = "telegram_text"):
+                             category: str, description: str, source: str = "telegram_text",
+                             telegram_file_id: str = None):
     conn = get_db()
     cur = conn.execute(
-        """INSERT INTO receipts (profile_id, merchant, total_amount, purchased_at, source)
-           VALUES (?, ?, ?, ?, ?)""",
-        (profile_id, merchant, amount, datetime.now().isoformat(), source),
+        """INSERT INTO receipts (profile_id, merchant, total_amount, purchased_at, source, telegram_file_id)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        (profile_id, merchant, amount, datetime.now().isoformat(), source, telegram_file_id),
     )
     receipt_id = cur.lastrowid
     conn.execute(
@@ -976,12 +1018,7 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username or user.first_name)
     if is_logged_in(user.id):
-        active_label = get_active_profile_label(user.id)
-        await update.message.reply_text(
-            f"Welcome back — active profile: {active_label}. Send a receipt photo or "
-            "just tell me what you spent, e.g. \"spent R150 on lunch at Nandos\". "
-            "Use /login ANOTHERCODE anytime to switch profiles."
-        )
+        await update.message.reply_text(build_welcome_back_text(user.id))
     else:
         await update.message.reply_text(
             "SlippiesBot beta is ONLINE.\n"
@@ -1001,7 +1038,12 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     code = context.args[0].upper()
     if license_code_valid(code):
         profile_id = log_user_in(user.id, code)
-        await update.message.reply_text(f"✅ Access granted — switched to profile: {code}.")
+
+        if not has_seen_intro(user.id):
+            await update.message.reply_text(FIRST_TIME_INTRO)
+            mark_intro_seen(user.id)
+        else:
+            await update.message.reply_text(build_welcome_back_text(user.id))
 
         if not has_import(profile_id):
             mark_import_asked(profile_id)
@@ -1013,6 +1055,44 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
     else:
         await update.message.reply_text("❌ License code not found.")
+
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📋 Everything I can do:\n\n"
+        "💸 LOGGING SPEND\n"
+        "Just tell me naturally:\n"
+        "  \"spent 150 on lunch at Nandos\"\n"
+        "  \"bought groceries at Woolworths for 432.50\"\n"
+        "Or send a photo of any receipt/slip — I'll read the amount, "
+        "merchant, and category automatically, and keep the photo safely on file.\n\n"
+        "💰 LOGGING INCOME\n"
+        "  \"got paid 5000 salary\"\n"
+        "  \"received 200 from Danica\"\n\n"
+        "📊 ASKING QUESTIONS\n"
+        "  \"how much did I spend on groceries this month?\"\n"
+        "  \"how much on transport this week?\"\n"
+        "  \"how much did I get paid?\"\n"
+        "  \"how much have I spent?\" — gives you the full total\n\n"
+        "📁 GETTING YOUR DATA\n"
+        "  \"give me my file\" — sends a full Excel export "
+        "(expenses + income, separate sheets)\n\n"
+        "📎 IMPORTING HISTORY\n"
+        "Upload a bank statement Excel file anytime and I'll import "
+        "it — itemized spend, income, and recurring debit orders all "
+        "get picked up automatically. Ask again anytime, even after "
+        "your first import.\n\n"
+        "🔔 WHAT I'LL MESSAGE YOU ABOUT (no need to ask)\n"
+        "  • A day before a recurring debit order is due\n"
+        "  • If I haven't heard from you in 2 days\n"
+        "  • A reminder to import your history, if you haven't yet\n\n"
+        "🔑 SWITCHING PROFILES\n"
+        "  /login ANOTHERCODE — switches your active profile "
+        "(e.g. personal vs business). Each profile's data stays "
+        "completely separate.\n\n"
+        "Just talk to me like a person — no need to remember exact "
+        "commands for most of this."
+    )
 
 
 async def addcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1177,7 +1257,8 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
         await update.message.reply_text(
             "I mostly understand spending and income updates right now — try something like "
             "\"spent R80 on groceries\", \"how much did I spend on transport this month\", "
-            "or send a receipt photo."
+            "or send a receipt photo.\n\n"
+            "Need help? Type /help for the full list of what I can do."
         )
 
 
@@ -1264,6 +1345,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     profile_id = get_active_profile(user.id)
     status_msg = await update.message.reply_text("AI is reading your slip... 🧠")
     try:
+        telegram_file_id = update.message.photo[-1].file_id  # Telegram already hosts this
         photo_file = await update.message.photo[-1].get_file()
         photo_bytes = bytes(await photo_file.download_as_bytearray())
 
@@ -1277,6 +1359,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             category=parsed.get("category", "other"),
             description=parsed.get("description", ""),
             source="telegram_photo",
+            telegram_file_id=telegram_file_id,
         )
 
         await status_msg.edit_text(
@@ -1346,6 +1429,7 @@ def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start_command))
+    app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("addcode", addcode_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
