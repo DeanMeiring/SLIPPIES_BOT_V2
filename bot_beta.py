@@ -387,6 +387,70 @@ def get_active_telegram_user_for_profile(profile_id: int) -> int:
     return row["user_id"] if row else None
 
 
+def get_last_logged_entry(profile_id: int) -> dict:
+    """Finds whichever the user logged most recently — expense or
+    income — restricted to live-logged entries (text/photo), never
+    bulk-imported bank data, so a casual 'delete last' can't wipe
+    real historical statement rows by accident. Sorts by ID as a
+    tiebreaker since processed_at/created_at only have second-level
+    resolution and can tie for rapid back-to-back entries."""
+    conn = get_db()
+    expense = conn.execute(
+        """SELECT receipt_id as id, merchant as label, total_amount as amount,
+                  purchased_at as date, 'expense' as kind
+           FROM receipts WHERE profile_id = ? AND source IN ('telegram_text', 'telegram_photo')
+           ORDER BY processed_at DESC, receipt_id DESC LIMIT 1""",
+        (profile_id,),
+    ).fetchone()
+    income = conn.execute(
+        """SELECT income_id as id, source as label, amount,
+                  received_at as date, 'income' as kind
+           FROM income WHERE profile_id = ? AND source_type = 'telegram_text'
+           ORDER BY created_at DESC, income_id DESC LIMIT 1""",
+        (profile_id,),
+    ).fetchone()
+    conn.close()
+
+    candidates = [dict(r) for r in (expense, income) if r]
+    if not candidates:
+        return None
+    # Use id as the true tiebreaker for "most recent" — ids only ever
+    # increase with insert order, unlike second-resolution timestamps
+    return max(candidates, key=lambda c: (c["date"], c["id"]))
+
+
+def delete_last_logged_entry(profile_id: int) -> dict:
+    entry = get_last_logged_entry(profile_id)
+    if not entry:
+        return None
+    conn = get_db()
+    if entry["kind"] == "expense":
+        conn.execute("DELETE FROM receipt_items WHERE receipt_id = ?", (entry["id"],))
+        conn.execute("DELETE FROM receipts WHERE receipt_id = ?", (entry["id"],))
+    else:
+        conn.execute("DELETE FROM income WHERE income_id = ?", (entry["id"],))
+    conn.commit()
+    conn.close()
+    return entry
+
+
+def edit_last_logged_entry_amount(profile_id: int, new_amount: float) -> dict:
+    entry = get_last_logged_entry(profile_id)
+    if not entry:
+        return None
+    conn = get_db()
+    if entry["kind"] == "expense":
+        conn.execute("UPDATE receipts SET total_amount = ? WHERE receipt_id = ?", (new_amount, entry["id"]))
+        conn.execute("UPDATE receipt_items SET amount = ? WHERE receipt_id = ?", (new_amount, entry["id"]))
+    else:
+        conn.execute("UPDATE income SET amount = ? WHERE income_id = ?", (new_amount, entry["id"]))
+    conn.commit()
+    conn.close()
+    entry["old_amount"] = entry["amount"]
+    entry["amount"] = new_amount
+    return entry
+
+
 def get_current_balance_estimate(profile_id: int) -> dict:
     """Anchors to the real bank balance from the most recent import,
     then adjusts for anything logged live (text/photo) since then —
@@ -862,13 +926,22 @@ INTENT_PROMPT = """Classify this Telegram message into exactly one category:
 - "category_query": user is asking how much they spent on something (e.g. "how much on groceries this month")
 - "income_query": user is asking how much they got paid or received (e.g. "how much did I get paid", "how much income this month")
 - "balance_query": user is asking how much money they have left/remaining (e.g. "how much money is left", "what's my balance")
+- "delete_last": user wants to delete/remove/undo the last thing they logged (e.g. "delete last", "remove that", "undo", "oops I sent that twice")
+- "edit_last": user wants to correct the amount of the last thing they logged (e.g. "actually it was 90 not 150", "change last amount to 200", "fix that to R80")
 - "request_file": user wants their transaction history as a downloadable file/Excel
 - "request_report": user wants a general summary of recent spending
 - "other": anything else (greeting, question, unrelated)
 
 Message: "{message}"
 
-Reply with ONLY one word: log_transaction, log_income, category_query, income_query, balance_query, request_file, request_report, or other."""
+Reply with ONLY one word: log_transaction, log_income, category_query, income_query, balance_query, delete_last, edit_last, request_file, request_report, or other."""
+
+PARSE_EDIT_AMOUNT_PROMPT = """The user wants to correct the amount of their last logged entry.
+Reply in EXACTLY this format, nothing else:
+amount: <the correct numeric amount only, no currency symbol>
+
+Message: "{message}"
+"""
 
 PARSE_INCOME_PROMPT = """Extract the income details from this message.
 Reply in EXACTLY this format, nothing else:
@@ -1356,10 +1429,24 @@ async def classify_intent(message_text: str) -> str:
     )
     intent = response.text.strip().lower()
     valid = ("log_transaction", "log_income", "category_query", "income_query",
-              "balance_query", "request_file", "request_report", "other")
+              "balance_query", "delete_last", "edit_last", "request_file", "request_report", "other")
     if intent not in valid:
         return "other"
     return intent
+
+
+async def parse_edit_amount(message_text: str) -> dict:
+    response = gemini_client.models.generate_content(
+        model=GEMINI_MODEL_NAME,
+        contents=PARSE_EDIT_AMOUNT_PROMPT.format(message=message_text),
+    )
+    lines = response.text.strip().split("\n")
+    parsed = {}
+    for line in lines:
+        if ":" in line:
+            key, _, value = line.partition(":")
+            parsed[key.strip()] = value.strip()
+    return parsed
 
 
 async def parse_income_entry(message_text: str) -> dict:
@@ -1482,7 +1569,10 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    text = (
         "📋 Everything I can do:\n\n"
         "💸 LOGGING SPEND\n"
         "Just tell me naturally:\n"
@@ -1493,19 +1583,28 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "💰 LOGGING INCOME\n"
         "  \"got paid 5000 salary\"\n"
         "  \"received 200 from Danica\"\n\n"
+        "✏️ FIXING MISTAKES\n"
+        "  \"delete last\" — removes the last thing you logged (great for "
+        "accidental duplicate photos)\n"
+        "  \"actually it was 90 not 150\" — corrects the amount on your last entry\n"
+        "  (Only works on things you logged via chat — imported bank statement "
+        "data isn't touched, for safety.)\n\n"
         "📊 ASKING QUESTIONS\n"
         "  \"how much did I spend on groceries this month?\"\n"
-        "  \"how much on transport this week?\"\n"
+        "  \"how much on fuel this week?\" — categories are now more detailed: "
+        "groceries, client entertainment, staff meals, fuel, vehicle maintenance, "
+        "parking/tolls, travel, electricity, water, telecoms, insurance, and more\n"
         "  \"how much did I get paid?\"\n"
-        "  \"how much have I spent?\" — gives you the full total\n\n"
+        "  \"how much have I spent?\" — full total\n"
+        "  \"how much money is left?\" — an estimate based on your last imported "
+        "bank balance plus anything logged since\n\n"
         "📁 GETTING YOUR DATA\n"
-        "  \"give me my file\" — sends a full Excel export "
-        "(expenses + income, separate sheets)\n\n"
+        "  \"give me my file\" — full Excel export (expenses + income, separate sheets)\n\n"
         "📎 IMPORTING HISTORY\n"
-        "Upload a bank statement Excel file anytime and I'll import "
-        "it — itemized spend, income, and recurring debit orders all "
-        "get picked up automatically. Ask again anytime, even after "
-        "your first import.\n\n"
+        "Upload a bank statement as Excel (.xlsx) or PDF anytime — itemized "
+        "spend, income, recurring debit orders, and your account balance all "
+        "get picked up automatically. Duplicate transactions are detected and "
+        "skipped automatically. Ask again anytime, even after your first import.\n\n"
         "🔔 WHAT I'LL MESSAGE YOU ABOUT (no need to ask)\n"
         "  • A day before a recurring debit order is due\n"
         "  • If I haven't heard from you in 2 days\n"
@@ -1517,6 +1616,19 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "Just talk to me like a person — no need to remember exact "
         "commands for most of this."
     )
+
+    if is_admin(user.id):
+        text += (
+            "\n\n👑 ADMIN COMMANDS (visible to you as an admin)\n"
+            "  /admin — overview of all accounts and activity\n"
+            "  /ping CODE [message] — nudge whoever's active on a profile\n"
+            "  /addcode CODE [label] — create a new license code\n"
+            "  /addadmin @username — grant admin access\n"
+            "  /removeadmin @username — revoke admin access\n"
+            "  /listadmins — see current admins"
+        )
+
+    await update.message.reply_text(text)
 
 
 async def addcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1813,6 +1925,44 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"and minus R{bal['expense_since']:.2f} logged out since then.\n\n"
                 f"⚠️ This is an estimate based on what's been logged — not a live bank connection. "
                 f"Upload a fresh statement anytime to re-anchor it to your real balance."
+            )
+
+    elif intent == "delete_last":
+        deleted = delete_last_logged_entry(profile_id)
+        if not deleted:
+            await update.message.reply_text(
+                "Nothing to delete — you haven't logged anything yet (or it was from a "
+                "bank statement import, which I don't delete via chat for safety)."
+            )
+        else:
+            kind_label = "expense" if deleted["kind"] == "expense" else "income"
+            await update.message.reply_text(
+                f"🗑️ Deleted: R{deleted['amount']:.2f} {kind_label} — {deleted['label']}"
+            )
+
+    elif intent == "edit_last":
+        parsed = await parse_edit_amount(message_text)
+        try:
+            new_amount = float(parsed.get("amount", "0"))
+        except ValueError:
+            new_amount = 0
+
+        if new_amount <= 0:
+            await update.message.reply_text(
+                "Couldn't catch the corrected amount — try again with a number, "
+                "e.g. \"actually it was 90 not 150\"."
+            )
+            return
+
+        edited = edit_last_logged_entry_amount(profile_id, new_amount)
+        if not edited:
+            await update.message.reply_text(
+                "Nothing to edit — you haven't logged anything yet (or it was from a "
+                "bank statement import, which I don't edit via chat for safety)."
+            )
+        else:
+            await update.message.reply_text(
+                f"✏️ Updated: {edited['label']} — R{edited['old_amount']:.2f} → R{edited['amount']:.2f}"
             )
 
     elif intent == "category_query":
