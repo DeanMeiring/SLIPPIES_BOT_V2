@@ -245,3 +245,16 @@ CREATE TABLE IF NOT EXISTS balance_snapshots (
 
 CREATE INDEX IF NOT EXISTS idx_balance_snapshots_profile
     ON balance_snapshots(profile_id, as_of_date);
+
+-- ------------------------------------------------------------
+-- 12. ADMIN_USERS
+-- Identity-based admin access — no secret typed into chat after the
+-- very first bootstrap. Being in this table (by Telegram user_id) is
+-- what grants access to /admin, /ping, /addadmin, etc.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS admin_users (
+    user_id         INTEGER PRIMARY KEY REFERENCES users(user_id),
+    added_by        INTEGER,            -- user_id of whoever added them, NULL for bootstrap admin
+    label           TEXT,               -- friendly name, e.g. "Dean"
+    added_at        TEXT NOT NULL DEFAULT (datetime('now'))
+);
