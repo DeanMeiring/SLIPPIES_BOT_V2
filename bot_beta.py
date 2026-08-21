@@ -10,6 +10,9 @@ Run with: python3 bot_beta.py
 
 import os
 import io
+import re
+import json
+import pdfplumber
 import sqlite3
 import logging
 from datetime import datetime, timedelta
@@ -277,6 +280,56 @@ def insert_income(profile_id: int, source: str, amount: float, received_at: str,
     conn.close()
 
 
+def save_balance_snapshot(profile_id: int, balance: float, as_of_date: str, source: str = "bulk_import"):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO balance_snapshots (profile_id, balance, as_of_date, source)
+           VALUES (?, ?, ?, ?)""",
+        (profile_id, balance, as_of_date, source),
+    )
+    conn.commit()
+    conn.close()
+
+
+def get_current_balance_estimate(profile_id: int) -> dict:
+    """Anchors to the real bank balance from the most recent import,
+    then adjusts for anything logged live (text/photo) since then —
+    an honest estimate, not a claim of live bank connectivity."""
+    conn = get_db()
+    snap = conn.execute(
+        """SELECT balance, as_of_date FROM balance_snapshots
+           WHERE profile_id = ? ORDER BY as_of_date DESC LIMIT 1""",
+        (profile_id,),
+    ).fetchone()
+
+    if not snap:
+        conn.close()
+        return {"has_snapshot": False}
+
+    since = snap["as_of_date"]
+    expense_since = conn.execute(
+        """SELECT COALESCE(SUM(total_amount),0) as total FROM receipts
+           WHERE profile_id = ? AND purchased_at > ? AND source != 'bulk_import'""",
+        (profile_id, since),
+    ).fetchone()["total"]
+    income_since = conn.execute(
+        """SELECT COALESCE(SUM(amount),0) as total FROM income
+           WHERE profile_id = ? AND received_at > ? AND source_type != 'bulk_import'""",
+        (profile_id, since),
+    ).fetchone()["total"]
+    conn.close()
+
+    estimated = snap["balance"] - expense_since + income_since
+    return {
+        "has_snapshot": True,
+        "snapshot_balance": snap["balance"],
+        "as_of_date": since,
+        "expense_since": expense_since,
+        "income_since": income_since,
+        "estimated_balance": estimated,
+    }
+
+
 def get_income_total(profile_id: int, days: int = 30, category: str = None) -> dict:
     """Sums income over the trailing N days. By default excludes
     transfer_in (money moved between your own accounts isn't 'getting
@@ -309,10 +362,87 @@ def categorize_income_locally(description: str, type_suffix: str = "") -> str:
     return "other_income"
 
 
-def bulk_insert_income(profile_id: int, rows: list, batch_id: str) -> int:
+def is_exact_duplicate_expense(profile_id: int, merchant: str, amount: float, purchased_at: str) -> bool:
+    """Strict check for bulk imports: same date, same amount to the cent,
+    same description. Bank data is precise enough that this rarely
+    misses a real duplicate or flags a false one."""
+    date_only = purchased_at[:10]
     conn = get_db()
-    inserted = 0
+    row = conn.execute(
+        """SELECT 1 FROM receipts
+           WHERE profile_id = ? AND merchant = ? AND total_amount = ?
+           AND substr(purchased_at, 1, 10) = ?""",
+        (profile_id, merchant, amount, date_only),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def is_exact_duplicate_income(profile_id: int, source: str, amount: float, received_at: str) -> bool:
+    date_only = received_at[:10]
+    conn = get_db()
+    row = conn.execute(
+        """SELECT 1 FROM income
+           WHERE profile_id = ? AND source = ? AND amount = ?
+           AND substr(received_at, 1, 10) = ?""",
+        (profile_id, source, amount, date_only),
+    ).fetchone()
+    conn.close()
+    return row is not None
+
+
+def _merchant_similarity(a: str, b: str) -> float:
+    """Cheap fuzzy match — good enough to catch 'Nandos' vs
+    'C*THE CRAZY S' style mismatches being genuinely different,
+    while catching near-identical spellings of the same merchant."""
+    a, b = a.lower().strip(), b.lower().strip()
+    if not a or not b:
+        return 0.0
+    if a == b:
+        return 1.0
+    shorter, longer = (a, b) if len(a) <= len(b) else (b, a)
+    if shorter in longer:
+        return 0.85
+    a_words, b_words = set(a.split()), set(b.split())
+    if not a_words or not b_words:
+        return 0.0
+    overlap = len(a_words & b_words) / len(a_words | b_words)
+    return overlap
+
+
+def is_likely_duplicate_expense(profile_id: int, merchant: str, amount: float, purchased_at: str) -> bool:
+    """Looser check for live-logged (text/photo) entries: ±1 day,
+    matching amount, fuzzy merchant name. Won't be perfect across a
+    receipt photo vs a bank-statement line for the same purchase, but
+    catches the common cases (same source logged twice, etc.)."""
+    date_obj = datetime.fromisoformat(purchased_at)
+    window_start = (date_obj - timedelta(days=1)).isoformat()
+    window_end = (date_obj + timedelta(days=1)).isoformat()
+    conn = get_db()
+    candidates = conn.execute(
+        """SELECT merchant FROM receipts
+           WHERE profile_id = ? AND total_amount = ?
+           AND purchased_at BETWEEN ? AND ?""",
+        (profile_id, amount, window_start, window_end),
+    ).fetchall()
+    conn.close()
+    return any(_merchant_similarity(merchant, c["merchant"] or "") >= 0.5 for c in candidates)
+
+
+def bulk_insert_income(profile_id: int, rows: list, batch_id: str) -> dict:
+    conn = get_db()
+    inserted, skipped = 0, 0
     for row in rows:
+        date_only = row["received_at"][:10]
+        existing = conn.execute(
+            """SELECT 1 FROM income
+               WHERE profile_id = ? AND source = ? AND amount = ?
+               AND substr(received_at, 1, 10) = ?""",
+            (profile_id, row["source"], row["amount"], date_only),
+        ).fetchone()
+        if existing:
+            skipped += 1
+            continue
         conn.execute(
             """INSERT INTO income (profile_id, source, amount, received_at, category, source_type)
                VALUES (?, ?, ?, ?, ?, 'bulk_import')""",
@@ -321,7 +451,7 @@ def bulk_insert_income(profile_id: int, rows: list, batch_id: str) -> int:
         inserted += 1
     conn.commit()
     conn.close()
-    return inserted
+    return {"inserted": inserted, "skipped_duplicates": skipped}
 
 
 def get_recent_summary(profile_id: int, limit: int = 10) -> list:
@@ -406,15 +536,26 @@ def mark_import_fulfilled(profile_id: int):
     conn.close()
 
 
-def bulk_insert_receipts(profile_id: int, rows: list, batch_id: str) -> int:
+def bulk_insert_receipts(profile_id: int, rows: list, batch_id: str) -> dict:
     """rows: list of dicts with merchant, amount, purchased_at, category.
     Writes both a receipts row AND a matching receipt_items row (with the
     locally-derived category) so bulk-imported spend shows up correctly
     in category queries — bank exports don't have line-item detail, but
-    they should still count toward category totals."""
+    they should still count toward category totals. Skips exact
+    duplicates (same date, amount, merchant) already in the profile."""
     conn = get_db()
-    inserted = 0
+    inserted, skipped = 0, 0
     for row in rows:
+        date_only = row["purchased_at"][:10]
+        existing = conn.execute(
+            """SELECT 1 FROM receipts
+               WHERE profile_id = ? AND merchant = ? AND total_amount = ?
+               AND substr(purchased_at, 1, 10) = ?""",
+            (profile_id, row["merchant"], row["amount"], date_only),
+        ).fetchone()
+        if existing:
+            skipped += 1
+            continue
         cur = conn.execute(
             """INSERT INTO receipts (profile_id, merchant, total_amount, purchased_at, source, import_batch_id)
                VALUES (?, ?, ?, ?, 'bulk_import', ?)""",
@@ -429,7 +570,7 @@ def bulk_insert_receipts(profile_id: int, rows: list, batch_id: str) -> int:
         inserted += 1
     conn.commit()
     conn.close()
-    return inserted
+    return {"inserted": inserted, "skipped_duplicates": skipped}
 
 
 def get_users_due_import_reminder(days: int = 90) -> list:
@@ -624,13 +765,14 @@ INTENT_PROMPT = """Classify this Telegram message into exactly one category:
 - "log_income": user is telling you about money they received/got paid
 - "category_query": user is asking how much they spent on something (e.g. "how much on groceries this month")
 - "income_query": user is asking how much they got paid or received (e.g. "how much did I get paid", "how much income this month")
+- "balance_query": user is asking how much money they have left/remaining (e.g. "how much money is left", "what's my balance")
 - "request_file": user wants their transaction history as a downloadable file/Excel
 - "request_report": user wants a general summary of recent spending
 - "other": anything else (greeting, question, unrelated)
 
 Message: "{message}"
 
-Reply with ONLY one word: log_transaction, log_income, category_query, income_query, request_file, request_report, or other."""
+Reply with ONLY one word: log_transaction, log_income, category_query, income_query, balance_query, request_file, request_report, or other."""
 
 PARSE_INCOME_PROMPT = """Extract the income details from this message.
 Reply in EXACTLY this format, nothing else:
@@ -652,7 +794,7 @@ PARSE_TRANSACTION_PROMPT = """Extract the transaction details from this message.
 Reply in EXACTLY this format, nothing else:
 merchant: <merchant or vendor name, or "unknown">
 amount: <numeric amount only, no currency symbol>
-category: <one of: groceries, eating_out, transport, household, entertainment, health, other>
+category: <one of: groceries, client_entertainment, staff_meals, fuel, vehicle_maintenance, parking_tolls, travel_flights, health, entertainment, electricity, water, telecoms_mobile, insurance, professional_services, repairs_maintenance, household, other>
 description: <short description of what was bought>
 
 Message: "{message}"
@@ -662,14 +804,14 @@ PARSE_RECEIPT_PHOTO_PROMPT = """This is a photo of a purchase receipt or slip.
 Extract the details and reply in EXACTLY this format, nothing else:
 merchant: <vendor/store name>
 amount: <total numeric amount only, no currency symbol>
-category: <one of: groceries, eating_out, transport, household, entertainment, health, other>
+category: <one of: groceries, client_entertainment, staff_meals, fuel, vehicle_maintenance, parking_tolls, travel_flights, health, entertainment, electricity, water, telecoms_mobile, insurance, professional_services, repairs_maintenance, household, other>
 description: <brief summary of main items, or the merchant name if items aren't legible>
 
 If any field is unclear from the image, make your best reasonable guess rather than leaving it blank."""
 
 CATEGORY_QUERY_PROMPT = """The user is asking how much they spent on something.
 Reply in EXACTLY this format, nothing else:
-category: <one of: groceries, eating_out, transport, household, entertainment, health, other, or "all" if not specific>
+category: <one of: groceries, client_entertainment, staff_meals, fuel, vehicle_maintenance, parking_tolls, travel_flights, health, entertainment, electricity, water, telecoms_mobile, insurance, professional_services, repairs_maintenance, household, other, or "all" if not specific>
 days: <number of days to look back — 7 for "this week", 30 for "this month", 365 for "this year", 30 if unclear>
 
 Message: "{message}"
@@ -714,18 +856,33 @@ import re
 
 CATEGORY_KEYWORDS = {
     "groceries": ["spar", "pnp", "pick n pay", "checkers", "woolworths", "kwikspar",
-                  "food lover", "boxer", "fruit", "dischem", "clicks"],
-    "eating_out": ["kfc", "steers", "nandos", "mcd", "debonairs", "wimpy", "vida",
-                   "mugg", "milky lane", "poke", "yoco", "cafe", "coffee", "restaur",
-                   "pizza", "uber eats", "mr d", "taste", "ginos", "simplygreek",
-                   "motherdough", "bootleggers", "fat cactus"],
-    "transport": ["shell", "engen", "bp ", "sasol", "total", "fuel", "petrol",
-                  "uber", "bolt", "railway", "gautrain", "toll"],
-    "health": ["dischem", "clicks", "pharmacy", "dr ", "doctor", "medical", "dentist"],
+                  "food lover", "boxer", "fruit", "cc fresh", "biz afrika", "fresh x"],
+    "client_entertainment": ["mugg", "milky lane", "vida", "cafe", "caffe", "coffee",
+                              "bistro", "restaur", "kitchen", "grill", "wine", "wimpy"],
+    "staff_meals": ["kfc", "steers", "nandos", "mcd", "debonairs", "poke", "yoco",
+                     "pizza", "uber eats", "mr d", "taste", "ginos", "simplygreek",
+                     "motherdough", "bootleggers", "fat cactus", "bakery"],
+    "fuel": ["shell", "engen", "sasol", "bp disa", "bp tyger", "total somerse",
+             "petrol", "lynedoch serv", "caltex"],
+    "vehicle_maintenance": ["dekra", "tyre", "auto st", "car service", "motor ",
+                             "panelbeater", "wheel"],
+    "parking_tolls": ["parking", "toll", "str parking", "cticc parking"],
+    "travel_flights": ["europcar", "travelstart", "acsa", "flight", "airbnb", "booking.com"],
+    "health": ["dischem", "clicks", "pharmacy", "dr ", "doctor", "medical", "dentist",
+               "life groenklo", "clinic"],
     "entertainment": ["sterkinekor", "ster kinekor", "steamgames", "playtomic",
-                       "matiesgym", "gym", "movie", "netflix", "showmax", "spotify"],
+                       "matiesgym", "gym", "movie", "netflix", "showmax", "spotify",
+                       "golf", "museum"],
+    "electricity": ["electricity"],
+    "water": ["water purchase", "crp water"],
+    "telecoms_mobile": ["vodacom", "mtn", "cell c", "prepaid mobile", "vodashop",
+                         "telecom", "voda"],
+    "insurance": ["insurance premium", "disclife", "disc prem", "medical aid",
+                   "mom_insure", "regsvir"],
+    "professional_services": ["accountant", "legal", "consult", "audit"],
+    "repairs_maintenance": ["dulux paint", "hardware", "repair"],
     "household": ["takealot", "gadget", "gadgettime", "evetech", "microsoft",
-                   "vodacom", "mtn", "cell c", "prepaid mobile", "vodashop"],
+                   "godaddy", "openai"],
 }
 
 
@@ -795,11 +952,13 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
     in_col = next((i for i, h in enumerate(headers) if h.strip().startswith("in")), None)
     out_col = next((i for i, h in enumerate(headers) if "out" in h), None)
     fee_col = next((i for i, h in enumerate(headers) if "fee" in h), None)
+    balance_col = next((i for i, h in enumerate(headers) if "balance" in h), None)
 
     if date_col is None or desc_col is None:
-        return {"expenses": [], "income": []}
+        return {"expenses": [], "income": [], "last_balance": None, "last_balance_date": None}
 
     expenses, income = [], []
+    last_balance, last_balance_date = None, None
     current_year = datetime.now().year  # fallback if no year row is ever found
 
     for row in ws.iter_rows(min_row=header_row_idx + 1, values_only=True):
@@ -826,6 +985,12 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
         except ValueError:
             continue  # unparseable date, skip rather than guess
 
+        bal_val = row[balance_col] if balance_col is not None and balance_col < len(row) else None
+        if isinstance(bal_val, (int, float)):
+            if last_balance_date is None or when >= last_balance_date:
+                last_balance = float(bal_val)
+                last_balance_date = when
+
         merchant = clean_merchant_description(str(desc_val))
         type_suffix = str(desc_val).split(" - ")[-1].strip() if " - " in str(desc_val) else ""
 
@@ -847,7 +1012,8 @@ def parse_bulk_excel(file_bytes: bytes) -> dict:
                 "category": categorize_income_locally(merchant, type_suffix),
             })
 
-    return {"expenses": expenses, "income": income}
+    return {"expenses": expenses, "income": income, "last_balance": last_balance,
+             "last_balance_date": last_balance_date}
 
 
 COLUMN_DETECTION_PROMPT = """This is the header row and a few sample rows from a bank
@@ -893,7 +1059,7 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
 
     all_rows = list(ws.iter_rows(min_row=1, max_row=10, values_only=True))
     if not all_rows:
-        return {"expenses": [], "income": []}
+        return {"expenses": [], "income": [], "last_balance": None, "last_balance_date": None}
 
     # Assume row 1 is the header — reasonable default for bank exports
     headers = [str(h).strip() if h else "" for h in all_rows[0]]
@@ -915,7 +1081,7 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
     date_format = mapping.get("date_format", "%Y-%m-%d").strip()
 
     if date_col is None or desc_col is None:
-        return {"expenses": [], "income": []}  # couldn't confidently map this file
+        return {"expenses": [], "income": [], "last_balance": None, "last_balance_date": None}  # couldn't confidently map this file
 
     expenses, income = [], []
     for row in ws.iter_rows(min_row=2, values_only=True):
@@ -952,7 +1118,141 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
                 income.append({"source": merchant, "amount": abs(row[credit_col]), "received_at": when,
                                 "category": categorize_income_locally(merchant)})
 
-    return {"expenses": expenses, "income": income}
+    return {"expenses": expenses, "income": income, "last_balance": None, "last_balance_date": None}
+
+
+PDF_TRANSACTION_EXTRACTION_PROMPT = """This is raw text extracted from a bank statement PDF.
+Extract every transaction you can find. Reply as a JSON array, nothing else — no markdown,
+no explanation. Each item must look exactly like this:
+
+{{"date": "YYYY-MM-DD", "description": "merchant/description text", "amount": -150.00, "type": "transaction type if shown, else empty string"}}
+
+Rules:
+- amount is negative for money OUT (spend/debit), positive for money IN (deposit/credit)
+- If a year isn't shown per-row, infer it from statement header dates or context
+- Skip lines that are headers, page footers, balance-only lines, or account summaries
+- Only include actual transaction lines
+
+Text:
+{text}
+"""
+
+
+async def parse_bulk_pdf(file_bytes: bytes) -> dict:
+    """Parses a bank statement PDF. Tries the fast Standard Bank text
+    pattern first (same format we already handle for Excel, since some
+    PDF exports linearize to the same Date/Description/Type/Amount
+    shape). Falls back to a Gemini extraction pass over the raw PDF
+    text for other banks' PDF layouts."""
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    # Try the fast Standard Bank text-pattern parser first
+    result = parse_standard_bank_text(full_text)
+    if result["expenses"] or result["income"]:
+        return result
+
+    # Fall back to Gemini extraction for other banks' PDF layouts.
+    # Chunk the text to stay within reasonable prompt size for long statements.
+    chunk_size = 6000
+    chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
+
+    expenses, income = [], []
+    for chunk in chunks:
+        if not chunk.strip():
+            continue
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents=PDF_TRANSACTION_EXTRACTION_PROMPT.format(text=chunk),
+        )
+        try:
+            raw = response.text.strip()
+            if raw.startswith("```"):
+                raw = raw.split("```")[1].lstrip("json").strip()
+            rows = json.loads(raw)
+        except (json.JSONDecodeError, IndexError):
+            continue
+
+        for row in rows:
+            try:
+                when = datetime.strptime(row["date"], "%Y-%m-%d").isoformat()
+                amt = float(row["amount"])
+                merchant = clean_merchant_description(str(row.get("description", "unknown")))
+                type_suffix = str(row.get("type", ""))
+            except (KeyError, ValueError, TypeError):
+                continue
+
+            if amt < 0:
+                category = categorize_locally(merchant, type_suffix)
+                expenses.append({
+                    "merchant": merchant, "amount": abs(amt), "purchased_at": when,
+                    "category": category, "is_debit_order": is_bank_labeled_debit_order(type_suffix),
+                })
+            elif amt > 0:
+                income.append({
+                    "source": merchant, "amount": amt, "received_at": when,
+                    "category": categorize_income_locally(merchant, type_suffix),
+                })
+
+    return {"expenses": expenses, "income": income, "last_balance": None, "last_balance_date": None}
+
+
+def parse_standard_bank_text(full_text: str) -> dict:
+    """Shared parsing logic for Standard Bank's Date/Description/Type/
+    Amount+Balance pattern, usable against either linearized PDF text
+    or (in principle) any text extraction with the same shape."""
+    lines = [l.strip() for l in full_text.split("\n") if l.strip()]
+
+    date_re = re.compile(r"^(\d{2}) (\w{3}) (\d{2,4}) (.+)$")
+    amount_re = re.compile(r"^(-?[\d,]+\.\d{2})\s+([\d,]+\.\d{2})$")
+    months = {"Jan": 1, "Feb": 2, "Mar": 3, "Apr": 4, "May": 5, "Jun": 6,
+              "Jul": 7, "Aug": 8, "Sep": 9, "Oct": 10, "Nov": 11, "Dec": 12}
+
+    expenses, income = [], []
+    last_balance, last_balance_date = None, None
+    i = 0
+    while i < len(lines):
+        m = date_re.match(lines[i])
+        if m:
+            day, mon, yr, desc = m.groups()
+            type_label = lines[i + 1] if i + 1 < len(lines) else ""
+            amt_line = lines[i + 2] if i + 2 < len(lines) else ""
+            am = amount_re.match(amt_line)
+            if am and mon in months:
+                amount = float(am.group(1).replace(",", ""))
+                balance = float(am.group(2).replace(",", ""))
+                year = int(yr) if len(yr) == 4 else 2000 + int(yr)
+                try:
+                    when = datetime(year, months[mon], int(day)).isoformat()
+                except ValueError:
+                    i += 1
+                    continue
+
+                merchant = clean_merchant_description(desc)
+                type_suffix = type_label
+
+                if last_balance_date is None or when >= last_balance_date:
+                    last_balance, last_balance_date = balance, when
+
+                if amount < 0:
+                    category = categorize_locally(merchant, type_suffix)
+                    expenses.append({
+                        "merchant": merchant, "amount": abs(amount), "purchased_at": when,
+                        "category": category, "is_debit_order": is_bank_labeled_debit_order(type_suffix),
+                    })
+                elif amount > 0:
+                    income.append({
+                        "source": merchant, "amount": amount, "received_at": when,
+                        "category": categorize_income_locally(merchant, type_suffix),
+                    })
+                i += 3
+                continue
+        i += 1
+
+    return {"expenses": expenses, "income": income, "last_balance": last_balance,
+             "last_balance_date": last_balance_date}
+
+
 async def classify_intent(message_text: str) -> str:
     response = gemini_client.models.generate_content(
         model=GEMINI_MODEL_NAME,
@@ -960,7 +1260,7 @@ async def classify_intent(message_text: str) -> str:
     )
     intent = response.text.strip().lower()
     valid = ("log_transaction", "log_income", "category_query", "income_query",
-              "request_file", "request_report", "other")
+              "balance_query", "request_file", "request_report", "other")
     if intent not in valid:
         return "other"
     return intent
@@ -1179,17 +1479,22 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
             )
             return
 
+        now_iso = datetime.now().isoformat()
+        merchant = parsed.get("merchant", "unknown")
+        possible_dupe = is_likely_duplicate_expense(profile_id, merchant, amount, now_iso)
+
         insert_receipt_and_item(
             profile_id=profile_id,
-            merchant=parsed.get("merchant", "unknown"),
+            merchant=merchant,
             amount=amount,
             category=parsed.get("category", "other"),
             description=parsed.get("description", message_text),
             source="telegram_text",
         )
+        dupe_note = " ⚠️ (looks similar to something already logged — check for a double-entry)" if possible_dupe else ""
         await update.message.reply_text(
             f"Logged: R{amount:.2f} — {parsed.get('category', 'other')} "
-            f"({parsed.get('merchant', 'unknown')})"
+            f"({merchant}){dupe_note}"
         )
         detect_recurring_transactions(profile_id)
 
@@ -1234,6 +1539,23 @@ async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE
                 f"💰 You've received R{result['total']:.2f} in the last {days} days "
                 f"({result['count']} item{'s' if result['count'] != 1 else ''}). "
                 f"(Internal transfers between your own accounts aren't counted.)"
+            )
+
+    elif intent == "balance_query":
+        bal = get_current_balance_estimate(profile_id)
+        if not bal["has_snapshot"]:
+            await update.message.reply_text(
+                "I don't have a real balance to work from yet — upload a bank statement "
+                "(Excel or PDF) and I'll use its ending balance as a starting point."
+            )
+        else:
+            await update.message.reply_text(
+                f"💰 Estimated balance: R{bal['estimated_balance']:.2f}\n\n"
+                f"Based on R{bal['snapshot_balance']:.2f} as of {bal['as_of_date'][:10]} "
+                f"(your last imported statement), plus R{bal['income_since']:.2f} logged in "
+                f"and minus R{bal['expense_since']:.2f} logged out since then.\n\n"
+                f"⚠️ This is an estimate based on what's been logged — not a live bank connection. "
+                f"Upload a fresh statement anytime to re-anchor it to your real balance."
             )
 
     elif intent == "category_query":
@@ -1307,8 +1629,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     profile_id = get_active_profile(user.id)
     doc = update.message.document
-    if not (doc.file_name or "").lower().endswith((".xlsx", ".xls")):
-        await update.message.reply_text("I can only import .xlsx or .xls files right now.")
+    filename = (doc.file_name or "").lower()
+    is_pdf = filename.endswith(".pdf")
+    is_excel = filename.endswith((".xlsx", ".xls"))
+
+    if not (is_pdf or is_excel):
+        await update.message.reply_text("I can import .xlsx, .xls, or .pdf bank statements right now.")
         return
 
     status_msg = await update.message.reply_text("Reading your file... 📖")
@@ -1316,18 +1642,19 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
         file = await doc.get_file()
         file_bytes = bytes(await file.download_as_bytearray())
 
-        parsed = parse_bulk_excel(file_bytes)
+        used_generic = False
+        if is_pdf:
+            parsed = await parse_bulk_pdf(file_bytes)
+        else:
+            parsed = parse_bulk_excel(file_bytes)
+            if not parsed["expenses"] and not parsed["income"]:
+                # Doesn't match Standard Bank's format — try the generic
+                # Gemini-assisted column-detection path instead
+                parsed = await parse_bulk_excel_generic(file_bytes)
+                used_generic = True
+
         expense_rows = parsed["expenses"]
         income_rows = parsed["income"]
-
-        used_generic = False
-        if not expense_rows and not income_rows:
-            # Doesn't match Standard Bank's format — try the generic
-            # Gemini-assisted column-detection path instead
-            parsed = await parse_bulk_excel_generic(file_bytes)
-            expense_rows = parsed["expenses"]
-            income_rows = parsed["income"]
-            used_generic = True
 
         if not expense_rows and not income_rows:
             await status_msg.edit_text(
@@ -1337,9 +1664,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         batch_id = f"{profile_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}"
-        expenses_inserted = bulk_insert_receipts(profile_id, expense_rows, batch_id)
-        income_inserted = bulk_insert_income(profile_id, income_rows, batch_id)
+        expense_result = bulk_insert_receipts(profile_id, expense_rows, batch_id)
+        income_result = bulk_insert_income(profile_id, income_rows, batch_id)
         mark_import_fulfilled(profile_id)
+
+        # Save a real balance anchor if the statement gave us one (Standard
+        # Bank format, Excel or PDF) — powers "how much money is left"
+        if parsed.get("last_balance") is not None:
+            save_balance_snapshot(profile_id, parsed["last_balance"], parsed["last_balance_date"])
 
         # Bank already told us which of these are debit orders — register
         # immediately instead of waiting on pattern detection
@@ -1353,12 +1685,18 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         detect_recurring_transactions(profile_id)
 
+        total_skipped = expense_result["skipped_duplicates"] + income_result["skipped_duplicates"]
+
         await status_msg.edit_text(
-            f"✅ Imported {expenses_inserted} expenses and {income_inserted} income entries "
-            f"into this profile"
+            f"✅ Imported {expense_result['inserted']} expenses and {income_result['inserted']} "
+            f"income entries into this profile"
             + (f", including {debit_order_count} recurring debit order(s) I'll remind you about."
                if debit_order_count else ".")
-            + " I'll use this as the baseline going forward."
+            + (f"\n⚠️ Skipped {total_skipped} that looked like exact duplicates of transactions "
+               f"already logged." if total_skipped else "")
+            + (f"\n💰 Balance as of {parsed['last_balance_date'][:10]}: R{parsed['last_balance']:.2f} "
+               f"— I'll use this for 'how much money is left'." if parsed.get("last_balance") is not None else "")
+            + "\nI'll use this as the baseline going forward."
             + (" (Used general format detection for this file — categorization may be rougher "
                "than usual, corrections help it improve.)" if used_generic else "")
         )
@@ -1385,10 +1723,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         parsed = await parse_receipt_photo(photo_bytes)
         amount = float(parsed.get("amount", "0"))
+        merchant = parsed.get("merchant", "unknown")
+        now_iso = datetime.now().isoformat()
+        possible_dupe = is_likely_duplicate_expense(profile_id, merchant, amount, now_iso)
 
         insert_receipt_and_item(
             profile_id=profile_id,
-            merchant=parsed.get("merchant", "unknown"),
+            merchant=merchant,
             amount=amount,
             category=parsed.get("category", "other"),
             description=parsed.get("description", ""),
@@ -1396,9 +1737,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             telegram_file_id=telegram_file_id,
         )
 
+        dupe_note = " ⚠️ (looks similar to something already logged — check for a double-entry)" if possible_dupe else ""
         await status_msg.edit_text(
             f"✅ Logged: R{amount:.2f} — {parsed.get('category', 'other')} "
-            f"({parsed.get('merchant', 'unknown')})"
+            f"({merchant}){dupe_note}"
         )
         detect_recurring_transactions(profile_id)
     except Exception as e:
