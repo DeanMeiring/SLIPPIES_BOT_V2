@@ -348,6 +348,73 @@ def find_user_id_by_username(username: str) -> int:
     return row["user_id"] if row else None
 
 
+def deactivate_profile(code: str) -> bool:
+    """Soft delete — blocks new logins (license_code_valid already checks
+    active=1) but leaves every row of data fully intact."""
+    conn = get_db()
+    cur = conn.execute("UPDATE license_codes SET active = 0 WHERE code = ?", (code,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def reactivate_profile(code: str) -> bool:
+    conn = get_db()
+    cur = conn.execute("UPDATE license_codes SET active = 1 WHERE code = ?", (code,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def get_profile_id_for_code(code: str) -> int:
+    conn = get_db()
+    row = conn.execute("SELECT profile_id FROM profiles WHERE license_code = ?", (code,)).fetchone()
+    conn.close()
+    return row["profile_id"] if row else None
+
+
+def is_profile_active(code: str) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT active FROM license_codes WHERE code = ?", (code,)).fetchone()
+    conn.close()
+    return bool(row and row["active"])
+
+
+def hard_delete_profile_data(profile_id: int, code: str) -> dict:
+    """Permanently removes every row tied to this profile, across every
+    table. Only ever called after the profile has already been
+    deactivated (soft-deleted) — see harddelete_command's two-stage gate."""
+    conn = get_db()
+
+    receipt_ids = [r["receipt_id"] for r in conn.execute(
+        "SELECT receipt_id FROM receipts WHERE profile_id = ?", (profile_id,)
+    ).fetchall()]
+
+    counts = {}
+    for rid in receipt_ids:
+        conn.execute("DELETE FROM category_corrections WHERE item_id IN "
+                     "(SELECT item_id FROM receipt_items WHERE receipt_id = ?)", (rid,))
+    conn.execute(
+        "DELETE FROM receipt_items WHERE receipt_id IN "
+        "(SELECT receipt_id FROM receipts WHERE profile_id = ?)", (profile_id,)
+    )
+    counts["receipts"] = conn.execute("DELETE FROM receipts WHERE profile_id = ?", (profile_id,)).rowcount
+    counts["income"] = conn.execute("DELETE FROM income WHERE profile_id = ?", (profile_id,)).rowcount
+    counts["recurring_transactions"] = conn.execute(
+        "DELETE FROM recurring_transactions WHERE profile_id = ?", (profile_id,)).rowcount
+    conn.execute("DELETE FROM spend_aggregates WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM nudges_sent WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM pending_imports WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM balance_snapshots WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM user_active_profile WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM profiles WHERE profile_id = ?", (profile_id,))
+    conn.execute("DELETE FROM license_codes WHERE code = ?", (code,))
+
+    conn.commit()
+    conn.close()
+    return counts
+
+
 def get_admin_overview() -> list:
     """Per-profile activity summary for /admin — counts and last-active
     date only, no financial amounts or merchant details."""
@@ -1568,6 +1635,27 @@ async def login_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ License code not found.")
 
 
+ADMIN_HELP_TEXT = (
+    "👑 ADMIN COMMANDS\n\n"
+    "📊 MONITORING\n"
+    "  /admin — overview of all accounts and activity (active/slowing/quiet, "
+    "transaction counts — no financial amounts shown)\n"
+    "  /ping CODE [message] — nudge whoever's currently active on a profile\n\n"
+    "🔑 MANAGING ACCESS\n"
+    "  /addcode CODE [label] — create a new license code\n"
+    "  /addadmin @username — grant admin access (they must have messaged "
+    "the bot at least once first)\n"
+    "  /removeadmin @username — revoke admin access\n"
+    "  /listadmins — see current admins\n\n"
+    "🗑️ DELETING AN ACCOUNT (two-stage, for safety)\n"
+    "  /deactivate CODE — blocks logins, keeps all data fully intact\n"
+    "  /reactivate CODE — undoes a deactivation\n"
+    "  /harddelete CODE — only works once already deactivated; sends a "
+    "backup Excel first, then requires /harddelete CODE CONFIRM to "
+    "permanently erase everything (cannot be undone)"
+)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     ensure_user(user.id, user.username or user.first_name)
@@ -1618,17 +1706,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     if is_admin(user.id):
-        text += (
-            "\n\n👑 ADMIN COMMANDS (visible to you as an admin)\n"
-            "  /admin — overview of all accounts and activity\n"
-            "  /ping CODE [message] — nudge whoever's active on a profile\n"
-            "  /addcode CODE [label] — create a new license code\n"
-            "  /addadmin @username — grant admin access\n"
-            "  /removeadmin @username — revoke admin access\n"
-            "  /listadmins — see current admins"
-        )
+        text += "\n\n" + ADMIN_HELP_TEXT + "\n\n(Type /adminhelp anytime to see just this section.)"
 
     await update.message.reply_text(text)
+
+
+async def adminhelp_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only. Regular commands are in /help.")
+        return
+
+    await update.message.reply_text(ADMIN_HELP_TEXT)
 
 
 async def addcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1817,6 +1908,98 @@ async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"✅ Pinged whoever's active on {code}.")
     except Exception as e:
         await update.message.reply_text(f"❌ Couldn't deliver the ping: {e}")
+
+
+async def deactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /deactivate CODE")
+        return
+
+    code = context.args[0].upper()
+    if not deactivate_profile(code):
+        await update.message.reply_text(f"❌ No profile found for code {code}.")
+        return
+    await update.message.reply_text(
+        f"🔒 {code} deactivated — no one can log into it anymore, but all its data is "
+        f"still fully intact. Use /reactivate {code} to undo this, or "
+        f"/harddelete {code} to permanently erase it."
+    )
+
+
+async def reactivate_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /reactivate CODE")
+        return
+
+    code = context.args[0].upper()
+    if not reactivate_profile(code):
+        await update.message.reply_text(f"❌ No profile found for code {code}.")
+        return
+    await update.message.reply_text(f"✅ {code} reactivated — logins work again.")
+
+
+async def harddelete_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Two-stage safety: the profile must already be deactivated first
+    (so there's a deliberate pause before anything permanent happens),
+    and the admin must explicitly add CONFIRM — a plain /harddelete
+    CODE always just explains what will happen instead of doing it."""
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+    if not context.args:
+        await update.message.reply_text("Usage: /harddelete CODE")
+        return
+
+    code = context.args[0].upper()
+    profile_id = get_profile_id_for_code(code)
+    if not profile_id:
+        await update.message.reply_text(f"❌ No profile found for code {code}.")
+        return
+
+    if is_profile_active(code):
+        await update.message.reply_text(
+            f"⚠️ {code} is still active. Run /deactivate {code} first — hard delete only "
+            f"works on already-deactivated profiles, as a safety pause."
+        )
+        return
+
+    confirmed = len(context.args) > 1 and context.args[1].upper() == "CONFIRM"
+
+    if not confirmed:
+        buffer = build_excel_export(profile_id)
+        await update.message.reply_document(
+            document=buffer,
+            filename=f"backup_{code}_before_delete.xlsx",
+            caption=(
+                f"⚠️ This is a backup of everything on {code} before you decide.\n\n"
+                f"This action is PERMANENT and cannot be undone. To actually proceed, run:\n"
+                f"/harddelete {code} CONFIRM"
+            ),
+        )
+        return
+
+    counts = hard_delete_profile_data(profile_id, code)
+    await update.message.reply_text(
+        f"🗑️ {code} permanently deleted.\n"
+        f"Removed: {counts['receipts']} receipts, {counts['income']} income entries, "
+        f"{counts['recurring_transactions']} recurring payment records, and all associated "
+        f"snapshots/history. This cannot be undone."
+    )
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2213,6 +2396,7 @@ def main():
 
     app.add_handler(CommandHandler("start", start_command))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("adminhelp", adminhelp_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("addcode", addcode_command))
     app.add_handler(CommandHandler("becomeadmin", becomeadmin_command))
@@ -2221,6 +2405,9 @@ def main():
     app.add_handler(CommandHandler("listadmins", listadmins_command))
     app.add_handler(CommandHandler("admin", admin_overview_command))
     app.add_handler(CommandHandler("ping", ping_command))
+    app.add_handler(CommandHandler("deactivate", deactivate_command))
+    app.add_handler(CommandHandler("reactivate", reactivate_command))
+    app.add_handler(CommandHandler("harddelete", harddelete_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
