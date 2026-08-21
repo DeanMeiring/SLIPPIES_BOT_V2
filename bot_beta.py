@@ -990,14 +990,16 @@ def mark_recurring_reminded(recurring_id: int):
 INTENT_PROMPT = """Classify this Telegram message into exactly one category:
 - "log_transaction": user is telling you about money they spent
 - "log_income": user is telling you about money they received/got paid
-- "category_query": user is asking how much they spent on something (e.g. "how much on groceries this month")
+- "category_query": user is asking for a TOTAL amount spent, either on a specific category or overall (e.g. "how much on groceries this month", "how much have I spent", "total spent in the last 15 days", "what did I spend this week")
 - "income_query": user is asking how much they got paid or received (e.g. "how much did I get paid", "how much income this month")
 - "balance_query": user is asking how much money they have left/remaining (e.g. "how much money is left", "what's my balance")
 - "delete_last": user wants to delete/remove/undo the last thing they logged (e.g. "delete last", "remove that", "undo", "oops I sent that twice")
 - "edit_last": user wants to correct the amount of the last thing they logged (e.g. "actually it was 90 not 150", "change last amount to 200", "fix that to R80")
 - "request_file": user wants their transaction history as a downloadable file/Excel
-- "request_report": user wants a general summary of recent spending
+- "request_report": user wants to SEE a LIST of individual recent transactions, not a total (e.g. "show me my recent transactions", "what have I bought lately")
 - "other": anything else (greeting, question, unrelated)
+
+If the user is asking for a NUMBER/TOTAL (how much, what's the total, what did I spend), always use category_query — never request_report. request_report is only for when they want to see a list of individual line items.
 
 Message: "{message}"
 
@@ -1045,10 +1047,11 @@ description: <brief summary of main items, or the merchant name if items aren't 
 
 If any field is unclear from the image, make your best reasonable guess rather than leaving it blank."""
 
-CATEGORY_QUERY_PROMPT = """The user is asking how much they spent on something.
+CATEGORY_QUERY_PROMPT = """The user is asking for a total amount spent — either on a
+specific category, or an overall total if they didn't mention one.
 Reply in EXACTLY this format, nothing else:
 category: <one of: groceries, client_entertainment, staff_meals, fuel, vehicle_maintenance, parking_tolls, travel_flights, health, entertainment, electricity, water, telecoms_mobile, insurance, professional_services, repairs_maintenance, household, other, or "all" if not specific>
-days: <number of days to look back — 7 for "this week", 30 for "this month", 365 for "this year", 30 if unclear>
+days: <number of days to look back. If the user states an exact number (e.g. "last 15 days" -> 15, "last 45 days" -> 45), use that exact number. Otherwise: 7 for "this week", 30 for "this month", 365 for "this year", 30 if genuinely unclear>
 
 Message: "{message}"
 """
