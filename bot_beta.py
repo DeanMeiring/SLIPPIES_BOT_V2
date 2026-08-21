@@ -291,6 +291,102 @@ def save_balance_snapshot(profile_id: int, balance: float, as_of_date: str, sour
     conn.close()
 
 
+def is_admin(user_id: int) -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM admin_users WHERE user_id = ?", (user_id,)).fetchone()
+    conn.close()
+    return row is not None
+
+
+def any_admin_exists() -> bool:
+    conn = get_db()
+    row = conn.execute("SELECT 1 FROM admin_users LIMIT 1").fetchone()
+    conn.close()
+    return row is not None
+
+
+def add_admin(user_id: int, added_by: int, label: str):
+    conn = get_db()
+    conn.execute(
+        """INSERT INTO admin_users (user_id, added_by, label) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET label = excluded.label""",
+        (user_id, added_by, label),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_admin(user_id: int) -> bool:
+    conn = get_db()
+    cur = conn.execute("DELETE FROM admin_users WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+    return cur.rowcount > 0
+
+
+def list_admins() -> list:
+    conn = get_db()
+    rows = conn.execute(
+        """SELECT a.user_id, a.label, a.added_at, u.username
+           FROM admin_users a LEFT JOIN users u ON a.user_id = u.user_id
+           ORDER BY a.added_at"""
+    ).fetchall()
+    conn.close()
+    return [dict(r) for r in rows]
+
+
+def find_user_id_by_username(username: str) -> int:
+    """Resolves a @username to a Telegram user_id — only works if that
+    person has messaged the bot at least once before (so we have their
+    username on record)."""
+    clean = username.lstrip("@").lower()
+    conn = get_db()
+    row = conn.execute(
+        "SELECT user_id FROM users WHERE LOWER(username) = ?", (clean,)
+    ).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
+
+
+def get_admin_overview() -> list:
+    """Per-profile activity summary for /admin — counts and last-active
+    date only, no financial amounts or merchant details."""
+    conn = get_db()
+    profiles = conn.execute("SELECT profile_id, license_code, label FROM profiles").fetchall()
+    overview = []
+    for p in profiles:
+        pid = p["profile_id"]
+        receipt_stats = conn.execute(
+            "SELECT COUNT(*) as cnt, MAX(processed_at) as last FROM receipts WHERE profile_id = ?",
+            (pid,),
+        ).fetchone()
+        income_stats = conn.execute(
+            "SELECT COUNT(*) as cnt, MAX(created_at) as last FROM income WHERE profile_id = ?",
+            (pid,),
+        ).fetchone()
+        total_txns = receipt_stats["cnt"] + income_stats["cnt"]
+        last_dates = [d for d in (receipt_stats["last"], income_stats["last"]) if d]
+        last_active = max(last_dates) if last_dates else None
+        overview.append({
+            "profile_id": pid,
+            "license_code": p["license_code"],
+            "label": p["label"],
+            "total_txns": total_txns,
+            "last_active": last_active,
+        })
+    conn.close()
+    return overview
+
+
+def get_active_telegram_user_for_profile(profile_id: int) -> int:
+    conn = get_db()
+    row = conn.execute(
+        "SELECT user_id FROM user_active_profile WHERE profile_id = ?", (profile_id,)
+    ).fetchone()
+    conn.close()
+    return row["user_id"] if row else None
+
+
 def get_current_balance_estimate(profile_id: int) -> dict:
     """Anchors to the real bank balance from the most recent import,
     then adjusts for anything logged live (text/photo) since then —
@@ -1424,30 +1520,191 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def addcode_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Usage: /addcode NEWCODE123 admin_secret [optional_label]
-    if len(context.args) < 2:
-        await update.message.reply_text(
-            "Usage: /addcode NEWCODE123 your_admin_secret [optional_label]"
-        )
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only. See /becomeadmin if this is a fresh setup.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /addcode NEWCODE123 [optional_label]")
         return
 
     new_code = context.args[0].upper()
-    provided_secret = context.args[1]
+    label = context.args[1] if len(context.args) >= 2 else ""
+    create_license_code(new_code, label)
+    await update.message.reply_text(f"✅ New code created: {new_code}")
 
-    if provided_secret != ADMIN_SECRET:
-        await update.message.reply_text("❌ Invalid admin secret.")
+
+async def becomeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """One-time bootstrap: the very first admin uses the env-var secret
+    once. After that, this command is permanently disabled — everything
+    else runs on Telegram identity via /addadmin, never a typed secret."""
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if any_admin_exists():
+        await update.message.reply_text(
+            "❌ An admin already exists — this bootstrap command is now disabled. "
+            "Ask an existing admin to run /addadmin @yourusername."
+        )
         return
 
-    label = context.args[2] if len(context.args) >= 3 else ""
-    create_license_code(new_code, label)
+    if not context.args or context.args[0] != ADMIN_SECRET:
+        await update.message.reply_text("Usage: /becomeadmin your_admin_secret")
+        return
 
-    # Try to delete the message so the admin secret doesn't sit in chat history
+    add_admin(user.id, added_by=None, label=user.username or user.first_name or "admin")
     try:
         await update.message.delete()
     except Exception:
         pass
+    await update.message.reply_text(
+        "✅ You're now the first admin. The secret is no longer needed — "
+        "use /addadmin @username to add others from here on."
+    )
 
-    await update.message.reply_text(f"✅ New code created: {new_code}")
+
+async def addadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /addadmin @username")
+        return
+
+    target_id = find_user_id_by_username(context.args[0])
+    if not target_id:
+        await update.message.reply_text(
+            "❌ Couldn't find that user — they need to have messaged me at least once first."
+        )
+        return
+
+    add_admin(target_id, added_by=user.id, label=context.args[0].lstrip("@"))
+    await update.message.reply_text(f"✅ {context.args[0]} added as an admin.")
+
+
+async def removeadmin_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /removeadmin @username")
+        return
+
+    target_id = find_user_id_by_username(context.args[0])
+    if not target_id or not remove_admin(target_id):
+        await update.message.reply_text("❌ Couldn't find that admin.")
+        return
+    await update.message.reply_text(f"✅ {context.args[0]} removed as an admin.")
+
+
+async def listadmins_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    admins = list_admins()
+    if not admins:
+        await update.message.reply_text("No admins yet.")
+        return
+    lines = [f"• {a['label'] or a['username'] or a['user_id']} (since {a['added_at'][:10]})" for a in admins]
+    await update.message.reply_text("👑 Current admins:\n" + "\n".join(lines))
+
+
+async def admin_overview_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    overview = get_admin_overview()
+    if not overview:
+        await update.message.reply_text("No accounts exist yet.")
+        return
+
+    now = datetime.now()
+    active, slowing, quiet = [], [], []
+    for p in overview:
+        if not p["last_active"]:
+            quiet.append(p)
+            continue
+        days_since = (now - datetime.fromisoformat(p["last_active"])).days
+        if days_since <= 3:
+            active.append(p)
+        elif days_since <= 14:
+            slowing.append(p)
+        else:
+            quiet.append(p)
+
+    lines = [
+        f"📊 Admin Overview\n",
+        f"Total accounts: {len(overview)} profiles\n",
+        f"🟢 Active (last 3 days): {len(active)}",
+        f"🟡 Slowing down (4-14 days): {len(slowing)}",
+        f"🔴 Gone quiet (14+ days) or never used: {len(quiet)}\n",
+        "Per account:",
+    ]
+    for p in sorted(overview, key=lambda x: x["last_active"] or "", reverse=True):
+        last = p["last_active"][:10] if p["last_active"] else "never"
+        label = p["label"] or p["license_code"]
+        lines.append(f"  {label:<16} — last active {last}  ({p['total_txns']} txns)")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def ping_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    ensure_user(user.id, user.username or user.first_name)
+
+    if not is_admin(user.id):
+        await update.message.reply_text("❌ Admins only.")
+        return
+
+    if not context.args:
+        await update.message.reply_text("Usage: /ping CODE [optional custom message]")
+        return
+
+    code = context.args[0].upper()
+    conn = get_db()
+    profile_row = conn.execute(
+        "SELECT profile_id FROM profiles WHERE license_code = ?", (code,)
+    ).fetchone()
+    conn.close()
+
+    if not profile_row:
+        await update.message.reply_text(f"❌ No profile found for code {code}.")
+        return
+
+    target_user = get_active_telegram_user_for_profile(profile_row["profile_id"])
+    if not target_user:
+        await update.message.reply_text(
+            f"⚠️ No one currently has {code} as their active profile — can't deliver a ping right now."
+        )
+        return
+
+    custom_message = " ".join(context.args[1:]) if len(context.args) > 1 else None
+    message_text = custom_message or "👋 Just checking in — anything to log?"
+
+    try:
+        await context.bot.send_message(chat_id=target_user, text=message_text)
+        await update.message.reply_text(f"✅ Pinged whoever's active on {code}.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Couldn't deliver the ping: {e}")
 
 
 async def handle_text_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1808,6 +2065,12 @@ def main():
     app.add_handler(CommandHandler("help", help_command))
     app.add_handler(CommandHandler("login", login_command))
     app.add_handler(CommandHandler("addcode", addcode_command))
+    app.add_handler(CommandHandler("becomeadmin", becomeadmin_command))
+    app.add_handler(CommandHandler("addadmin", addadmin_command))
+    app.add_handler(CommandHandler("removeadmin", removeadmin_command))
+    app.add_handler(CommandHandler("listadmins", listadmins_command))
+    app.add_handler(CommandHandler("admin", admin_overview_command))
+    app.add_handler(CommandHandler("ping", ping_command))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_message))
     app.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     app.add_handler(MessageHandler(filters.Document.ALL, handle_document))
