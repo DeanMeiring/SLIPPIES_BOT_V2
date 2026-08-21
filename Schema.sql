@@ -58,7 +58,8 @@ CREATE TABLE IF NOT EXISTS users (
     nudge_opt_in    INTEGER NOT NULL DEFAULT 1,   -- 1 = wants proactive messages, 0 = off
     last_nudge_at   TEXT,                   -- prevents spamming; set after every push
     license_code    TEXT REFERENCES license_codes(code),  -- NULL until /login succeeds
-    logged_in_at    TEXT
+    logged_in_at    TEXT,
+    has_seen_intro  INTEGER NOT NULL DEFAULT 0  -- 1 once the first-time intro has been shown
 );
 
 -- ------------------------------------------------------------
@@ -76,7 +77,10 @@ CREATE TABLE IF NOT EXISTS receipts (
     processed_at    TEXT NOT NULL DEFAULT (datetime('now')),
     raw_ocr_text    TEXT,                   -- keep Gemini's raw output for future re-parsing
     source          TEXT DEFAULT 'telegram_photo',  -- 'telegram_photo' or 'bulk_import'
-    import_batch_id TEXT                    -- groups rows from the same uploaded file, NULL for live receipts
+    import_batch_id TEXT,                   -- groups rows from the same uploaded file, NULL for live receipts
+    telegram_file_id TEXT                   -- Telegram's own file reference — lets us re-fetch
+                                             -- the original photo later at near-zero storage cost,
+                                             -- since Telegram hosts the file, not us
 );
 
 CREATE INDEX IF NOT EXISTS idx_receipts_profile_date
@@ -221,3 +225,23 @@ CREATE TABLE IF NOT EXISTS income (
 
 CREATE INDEX IF NOT EXISTS idx_income_profile_date
     ON income(profile_id, received_at);
+
+-- ------------------------------------------------------------
+-- 11. BALANCE_SNAPSHOTS
+-- Captures the real bank balance from the last transaction in each
+-- bulk import (Excel/PDF). "How much money is left" reads the most
+-- recent snapshot, then adjusts for any live-logged transactions
+-- dated after it — this is an honest estimate anchored to real bank
+-- data, not a running total the bot might have drifted from.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS balance_snapshots (
+    snapshot_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      INTEGER NOT NULL REFERENCES profiles(profile_id),
+    balance         REAL NOT NULL,
+    as_of_date      TEXT NOT NULL,      -- date of the last transaction in the import
+    source          TEXT DEFAULT 'bulk_import',
+    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_balance_snapshots_profile
+    ON balance_snapshots(profile_id, as_of_date);
