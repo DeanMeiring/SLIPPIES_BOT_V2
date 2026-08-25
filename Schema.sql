@@ -30,7 +30,9 @@ CREATE TABLE IF NOT EXISTS profiles (
     profile_id      INTEGER PRIMARY KEY AUTOINCREMENT,
     license_code    TEXT UNIQUE NOT NULL REFERENCES license_codes(code),
     label           TEXT,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    import_cooldown_days INTEGER NOT NULL DEFAULT 90,
+    last_import_at  TEXT
 );
 
 -- ------------------------------------------------------------
@@ -258,3 +260,29 @@ CREATE TABLE IF NOT EXISTS admin_users (
     label           TEXT,               -- friendly name, e.g. "Dean"
     added_at        TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+-- ------------------------------------------------------------
+-- 13. BUDGETS
+-- One row per category (or "overall") per profile. Rolling monthly
+-- window (30 days), matching the day-window pattern used everywhere
+-- else in the bot.
+-- ------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS budgets (
+    budget_id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    profile_id      INTEGER NOT NULL REFERENCES profiles(profile_id),
+    category        TEXT NOT NULL,      -- specific category, group term, or "overall"
+    amount          REAL NOT NULL,
+    period_days     INTEGER NOT NULL DEFAULT 30,
+    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at      TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(profile_id, category)
+);
+
+-- ------------------------------------------------------------
+-- 14. Import cooldown settings — added as columns on profiles
+-- (SQLite doesn't support IF NOT EXISTS on ALTER TABLE ADD COLUMN,
+-- so these are also listed in COLUMN_MIGRATIONS in bot_beta.py for
+-- self-healing on already-deployed volumes)
+-- ------------------------------------------------------------
+-- profiles.import_cooldown_days INTEGER DEFAULT 90
+-- profiles.last_import_at TEXT
