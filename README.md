@@ -114,3 +114,6 @@ per-user data to justify it.
   (Medfly outbreak prediction), plus a working XGBoost pipeline already in
   production for crypto price forecasting (see `STOCK` repo) — same
   predict → evaluate → retrain loop applies here.
+
+
+  Still few things to do.
