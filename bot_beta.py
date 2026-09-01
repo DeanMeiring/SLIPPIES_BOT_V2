@@ -1268,6 +1268,7 @@ description_col: <index>
 amount_col: <index, if there's ONE column with signed amounts (negative=spend, positive=income), else "none">
 debit_col: <index, if spend/debit is a SEPARATE column, else "none">
 credit_col: <index, if income/credit is a SEPARATE column, else "none">
+balance_col: <index, if there's a running/closing account balance column, else "none">
 date_format: <a Python strptime format string matching the date values shown, e.g. %d/%m/%Y or %Y-%m-%d>
 """
 
@@ -1317,12 +1318,14 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
     amount_col = to_int(mapping.get("amount_col"))
     debit_col = to_int(mapping.get("debit_col"))
     credit_col = to_int(mapping.get("credit_col"))
+    balance_col = to_int(mapping.get("balance_col"))
     date_format = mapping.get("date_format", "%Y-%m-%d").strip()
 
     if date_col is None or desc_col is None:
         return {"expenses": [], "income": [], "last_balance": None, "last_balance_date": None}  # couldn't confidently map this file
 
     expenses, income = [], []
+    last_balance, last_balance_date = None, None
     for row in ws.iter_rows(min_row=2, values_only=True):
         if date_col >= len(row) or desc_col >= len(row):
             continue
@@ -1341,6 +1344,12 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
         merchant = str(desc_val).strip()
         category = categorize_locally(merchant)
 
+        bal_val = row[balance_col] if balance_col is not None and balance_col < len(row) else None
+        if isinstance(bal_val, (int, float)):
+            if last_balance_date is None or when >= last_balance_date:
+                last_balance = float(bal_val)
+                last_balance_date = when
+
         if amount_col is not None and amount_col < len(row) and isinstance(row[amount_col], (int, float)):
             amt = row[amount_col]
             if amt < 0:
@@ -1357,18 +1366,21 @@ async def parse_bulk_excel_generic(file_bytes: bytes) -> dict:
                 income.append({"source": merchant, "amount": abs(row[credit_col]), "received_at": when,
                                 "category": categorize_income_locally(merchant)})
 
-    return {"expenses": expenses, "income": income, "last_balance": None, "last_balance_date": None}
+    return {"expenses": expenses, "income": income, "last_balance": last_balance,
+            "last_balance_date": last_balance_date}
 
 
 PDF_TRANSACTION_EXTRACTION_PROMPT = """This is raw text extracted from a bank statement PDF.
 Extract every transaction you can find. Reply as a JSON array, nothing else — no markdown,
 no explanation. Each item must look exactly like this:
 
-{{"date": "YYYY-MM-DD", "description": "merchant/description text", "amount": -150.00, "type": "transaction type if shown, else empty string"}}
+{{"date": "YYYY-MM-DD", "description": "merchant/description text", "amount": -150.00, "type": "transaction type if shown, else empty string", "balance": 4231.50}}
 
 Rules:
 - amount is negative for money OUT (spend/debit), positive for money IN (deposit/credit)
 - If a year isn't shown per-row, infer it from statement header dates or context
+- "balance" is the running/closing account balance shown alongside that transaction line,
+  if the statement includes one — use JSON null (not a string) if no balance is shown for that line
 - Skip lines that are headers, page footers, balance-only lines, or account summaries
 - Only include actual transaction lines
 
@@ -1397,6 +1409,7 @@ async def parse_bulk_pdf(file_bytes: bytes) -> dict:
     chunks = [full_text[i:i + chunk_size] for i in range(0, len(full_text), chunk_size)]
 
     expenses, income = [], []
+    last_balance, last_balance_date = None, None
     for chunk in chunks:
         if not chunk.strip():
             continue
@@ -1421,6 +1434,12 @@ async def parse_bulk_pdf(file_bytes: bytes) -> dict:
             except (KeyError, ValueError, TypeError):
                 continue
 
+            bal_val = row.get("balance")
+            if isinstance(bal_val, (int, float)):
+                if last_balance_date is None or when >= last_balance_date:
+                    last_balance = float(bal_val)
+                    last_balance_date = when
+
             if amt < 0:
                 category = categorize_locally(merchant, type_suffix)
                 expenses.append({
@@ -1433,7 +1452,8 @@ async def parse_bulk_pdf(file_bytes: bytes) -> dict:
                     "category": categorize_income_locally(merchant, type_suffix),
                 })
 
-    return {"expenses": expenses, "income": income, "last_balance": None, "last_balance_date": None}
+    return {"expenses": expenses, "income": income, "last_balance": last_balance,
+            "last_balance_date": last_balance_date}
 
 
 def parse_standard_bank_text(full_text: str) -> dict:
